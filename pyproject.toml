@@ -1,0 +1,16 @@
+[project]
+name = "aur-diff-sentinel"
+version = "0.1.0"
+description = "A small CLI tool to highlight suspicious patterns in AUR PKGBUILDs and diffs."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+aur-diff-sentinel = "aur_diff_sentinel.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
