@@ -46,6 +46,9 @@ class SourceLine:
     content: str
     filename: str | None = None
     source_type: str = "file"
+    diff_line_number: int | None = None
+    target_line_number: int | None = None
+    change_type: str | None = None
 
 
 @dataclass(frozen=True)
@@ -57,3 +60,7 @@ class Finding:
     line_content: str
     hint: str
     filename: str | None = None
+    source_type: str = "file"
+    diff_line_number: int | None = None
+    target_line_number: int | None = None
+    change_type: str | None = None

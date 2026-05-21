@@ -13,7 +13,7 @@ aur-diff-sentinel --diff update.diff
 
 ## What it looks for
 
-v0.1 uses conservative line-based checks for:
+aur-diff-sentinel uses conservative line-based checks for:
 
 - skipped checksums
 - `eval`
@@ -24,6 +24,9 @@ v0.1 uses conservative line-based checks for:
 - `sh -c` / `bash -c`
 - shell `source` commands
 - obvious obfuscated command execution
+
+In `--diff` mode, it scans added lines from unified diffs and reports findings
+against the target file and line number when hunk metadata is available.
 
 ## Exit codes
 

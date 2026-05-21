@@ -72,8 +72,58 @@ class ScannerTests(unittest.TestCase):
         lines = source_lines_from_diff(text)
 
         self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0].line_number, 3)
+        self.assertEqual(lines[0].line_number, 1)
+        self.assertEqual(lines[0].target_line_number, 1)
+        self.assertEqual(lines[0].diff_line_number, 3)
+        self.assertEqual(lines[0].filename, "PKGBUILD")
+        self.assertEqual(lines[0].change_type, "added")
         self.assertEqual(lines[0].content, 'eval "$flags"')
+
+    def test_diff_target_line_numbers_are_tracked(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -10,3 +20,4 @@",
+                " context_before",
+                "-old_checksum",
+                "+eval \"$flags\"",
+                " context_after",
+                "+chmod 4755 \"$pkgdir/usr/bin/example\"",
+            ]
+        )
+        lines = source_lines_from_diff(text)
+
+        self.assertEqual([line.line_number for line in lines], [21, 23])
+        self.assertEqual([line.target_line_number for line in lines], [21, 23])
+        self.assertEqual([line.diff_line_number for line in lines], [7, 9])
+        self.assertEqual([line.filename for line in lines], ["PKGBUILD", "PKGBUILD"])
+
+    def test_diff_multi_file_filenames_are_tracked(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "+eval \"$flags\"",
+                "diff --git a/example.install b/example.install",
+                "--- a/example.install",
+                "+++ b/example.install",
+                "@@ -3 +3 @@",
+                "+systemctl start example.service",
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertEqual(
+            [(finding.filename, finding.line_number, finding.rule_id) for finding in findings],
+            [
+                ("PKGBUILD", 1, "eval-used"),
+                ("example.install", 3, "privilege-command"),
+            ],
+        )
 
 
 class CliTests(unittest.TestCase):
@@ -108,7 +158,9 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("eval-used", stdout)
+        self.assertIn("PKGBUILD:4", stdout)
         self.assertNotIn("+++ b/PKGBUILD", stdout)
+        self.assertNotIn(str(SAMPLES / "suspicious.diff"), stdout)
 
 
 if __name__ == "__main__":
