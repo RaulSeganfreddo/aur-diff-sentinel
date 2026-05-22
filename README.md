@@ -96,8 +96,9 @@ Verdict: manual review strongly recommended.
 Use `--verbose` to include matched source lines and rule hints.
 For source and checksum comparison findings, verbose output also includes old and new values.
 
-When using `updates`, the output is grouped by package and always ends by making
-clear that no packages were updated.
+When using `updates`, the output starts with an attention summary so packages
+with high- or medium-severity findings are easy to inspect first. Packages with
+no findings are still listed.
 
 ## Exit codes
 

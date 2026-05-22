@@ -13,10 +13,11 @@ from unittest.mock import patch
 
 from aur_diff_sentinel.cache import AurCache, metadata_version
 from aur_diff_sentinel.cli import run
+from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import AurUpdate, discover_updates, parse_update_output
-from aur_diff_sentinel.report import format_findings
+from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
-from aur_diff_sentinel.update_review import review_updates
+from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult, review_updates
 
 
 SAMPLES = Path(__file__).parent / "samples"
@@ -554,6 +555,120 @@ class ReportTests(unittest.TestCase):
 
         self.assertIn("old: https://github.com/example/app/archive/v1.0.tar.gz", report)
         self.assertIn("new: http://downloads.example.net/app/v1.0.tar.gz", report)
+
+    def test_update_report_groups_packages_by_attention(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("high-pkg", "1.0-1", "1.1-1"),
+                    findings=[
+                        _finding("source-domain-changed", Severity.HIGH),
+                        _finding("checksum-skip-added", Severity.HIGH),
+                    ],
+                ),
+                PackageReview(
+                    update=AurUpdate("clean-pkg", "2.0-1", "2.1-1"),
+                ),
+                PackageReview(
+                    update=AurUpdate("medium-pkg", "3.0-1", "3.1-1"),
+                    findings=[_finding("install-script", Severity.MEDIUM)],
+                ),
+            ]
+        )
+        report = format_update_review(result)
+
+        self.assertLess(report.index("High attention:"), report.index("Medium attention:"))
+        self.assertLess(report.index("Medium attention:"), report.index("No findings:"))
+        self.assertIn("- high-pkg: source domain changed, checksum SKIP added", report)
+        self.assertIn("- medium-pkg: install script referenced", report)
+        self.assertIn("- clean-pkg", report)
+        self.assertIn("Details:", report)
+        self.assertIn("high-pkg: 1.0-1 -> 1.1-1", report)
+        self.assertIn("medium-pkg: 3.0-1 -> 3.1-1", report)
+        self.assertNotIn("clean-pkg: 2.0-1 -> 2.1-1", report)
+
+    def test_update_report_reason_summary_is_deduplicated_and_capped(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("busy-pkg", "1.0-1", "1.1-1"),
+                    findings=[
+                        _finding("source-domain-changed", Severity.HIGH),
+                        _finding("source-domain-changed", Severity.HIGH),
+                        _finding("checksum-skip-added", Severity.HIGH),
+                        _finding("curl-pipe-shell", Severity.HIGH),
+                        _finding("install-script", Severity.MEDIUM),
+                    ],
+                )
+            ]
+        )
+        report = format_update_review(result)
+
+        self.assertIn(
+            "- busy-pkg: source domain changed, checksum SKIP added, "
+            "remote download piped to shell, +1 more",
+            report,
+        )
+
+    def test_update_report_keeps_note_only_package_details(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("note-pkg", "1.0-1", "1.1-1"),
+                    notes=["No review baseline could be found."],
+                )
+            ]
+        )
+        report = format_update_review(result)
+
+        self.assertIn("No findings:", report)
+        self.assertIn("- note-pkg", report)
+        self.assertIn("Details:", report)
+        self.assertIn("note-pkg: 1.0-1 -> 1.1-1", report)
+        self.assertIn("note: No review baseline could be found.", report)
+
+    def test_update_report_verbose_still_includes_finding_details(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("verbose-pkg", "1.0-1", "1.1-1"),
+                    findings=[
+                        _finding(
+                            "source-domain-changed",
+                            Severity.HIGH,
+                            old_value="https://old.example/app.tar.gz",
+                            new_value="https://new.example/app.tar.gz",
+                        )
+                    ],
+                )
+            ]
+        )
+        report = format_update_review(result, verbose=True)
+
+        self.assertIn("line: sha256sums=('SKIP')", report)
+        self.assertIn("old: https://old.example/app.tar.gz", report)
+        self.assertIn("new: https://new.example/app.tar.gz", report)
+        self.assertIn("hint: review this finding", report)
+
+
+def _finding(
+    rule_id: str,
+    severity: Severity,
+    *,
+    old_value: str | None = None,
+    new_value: str | None = None,
+) -> Finding:
+    return Finding(
+        rule_id=rule_id,
+        severity=severity,
+        message=rule_id.replace("-", " "),
+        line_number=4,
+        line_content="sha256sums=('SKIP')",
+        hint="review this finding",
+        filename="PKGBUILD",
+        old_value=old_value,
+        new_value=new_value,
+    )
 
 
 class ProviderTests(unittest.TestCase):
