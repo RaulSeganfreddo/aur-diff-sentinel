@@ -1,8 +1,83 @@
 from __future__ import annotations
 
 import re
+import shlex
 
-from aur_diff_sentinel.models import Rule, Severity
+from aur_diff_sentinel.models import Rule, Severity, SourceLine
+
+
+BUILD_FUNCTIONS = {"prepare", "build", "check", "package"}
+SENSITIVE_PATH_PREFIXES = ("/usr", "/etc", "/var", "/home", "/root")
+
+NETWORK_IN_BUILD_RE = re.compile(
+    r"(^\s*|[;&|]\s*)("
+    r"curl(\s|$)|"
+    r"wget(\s|$)|"
+    r"git\s+clone(\s|$)|"
+    r"npm\s+install(\s|$)|"
+    r"pip[0-9.]*\s+install(\s|$)|"
+    r"go\s+get(\s|$)|"
+    r"cargo\s+install(\s|$)"
+    r")",
+    re.IGNORECASE,
+)
+REDIRECT_TO_SENSITIVE_PATH_RE = re.compile(
+    r"(>|>>)\s*['\"]?(/usr|/etc|/var|/home|/root)(/|\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_build_function(line: SourceLine) -> bool:
+    return line.function_name in BUILD_FUNCTIONS
+
+
+def _network_in_build(line: SourceLine) -> bool:
+    return _is_build_function(line) and NETWORK_IN_BUILD_RE.search(line.content) is not None
+
+
+def _is_sensitive_path(token: str) -> bool:
+    return any(
+        token == prefix or token.startswith(f"{prefix}/")
+        for prefix in SENSITIVE_PATH_PREFIXES
+    )
+
+
+def _tokens(line: str) -> list[str]:
+    try:
+        return shlex.split(line, comments=False, posix=True)
+    except ValueError:
+        return line.split()
+
+
+def _non_option_tokens(tokens: list[str]) -> list[str]:
+    return [token for token in tokens if not token.startswith("-")]
+
+
+def _writes_outside_pkgdir(line: SourceLine) -> bool:
+    if not _is_build_function(line):
+        return False
+
+    if REDIRECT_TO_SENSITIVE_PATH_RE.search(line.content):
+        return True
+
+    tokens = _tokens(line.content)
+    if not tokens:
+        return False
+
+    command = tokens[0]
+    if command not in {"install", "cp", "mv", "mkdir", "touch", "chmod", "chown"}:
+        return False
+
+    if command in {"install", "cp", "mv"}:
+        return len(tokens) > 1 and _is_sensitive_path(tokens[-1])
+
+    operands = _non_option_tokens(tokens[1:])
+    if command == "chmod" and len(operands) > 1:
+        operands = operands[1:]
+    if command == "chown" and len(operands) > 1:
+        operands = operands[1:]
+
+    return any(_is_sensitive_path(token) for token in operands)
 
 
 RULES: list[Rule] = [
@@ -68,5 +143,19 @@ RULES: list[Rule] = [
         pattern=r"(\bbase64\s+(-d|--decode)\b[^|;]*\|\s*(/usr/bin/)?(ba)?sh\b|\bxxd\s+-r\b|\bopenssl\s+enc\s+-d\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b|\bawk\b.*\bsystem\s*\()",
         message="Obfuscated or compact dynamic execution detected",
         hint="Obfuscation or one-liner interpreters can hide behavior from review.",
+    ),
+    Rule.contextual(
+        id="network-in-build",
+        severity=Severity.HIGH,
+        matcher=_network_in_build,
+        message="Network activity inside build function",
+        hint="PKGBUILDs should normally declare downloaded inputs in source=().",
+    ),
+    Rule.contextual(
+        id="writes-outside-pkgdir",
+        severity=Severity.HIGH,
+        matcher=_writes_outside_pkgdir,
+        message="Command may write outside $pkgdir",
+        hint="Package files should normally be staged under $pkgdir.",
     ),
 ]

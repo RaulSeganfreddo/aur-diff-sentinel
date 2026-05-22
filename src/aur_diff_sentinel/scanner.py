@@ -8,13 +8,62 @@ from aur_diff_sentinel.rules import RULES
 
 
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+FUNCTION_START_RE = re.compile(
+    r"^\s*(?:function\s+)?(prepare|build|check|package)\s*(?:\(\s*\))?\s*\{"
+)
+
+
+def _is_full_line_comment(content: str) -> bool:
+    return content.lstrip().startswith("#")
+
+
+def _brace_delta(content: str) -> int:
+    return content.count("{") - content.count("}")
+
+
+class PkgbuildContextTracker:
+    def __init__(self) -> None:
+        self.function_name: str | None = None
+        self.brace_depth = 0
+
+    def annotate(self, content: str) -> str | None:
+        if _is_full_line_comment(content):
+            return self.function_name
+
+        function_match = None
+        if self.function_name is None:
+            function_match = FUNCTION_START_RE.match(content)
+            if function_match:
+                self.function_name = function_match.group(1)
+                self.brace_depth = 0
+
+        function_name = self.function_name
+
+        if self.function_name is not None:
+            self.brace_depth += _brace_delta(content)
+            if self.brace_depth <= 0:
+                self.function_name = None
+                self.brace_depth = 0
+
+        return function_name
 
 
 def source_lines_from_text(text: str, filename: str | None = None) -> list[SourceLine]:
-    return [
-        SourceLine(line_number=index, content=line, filename=filename, source_type="file")
-        for index, line in enumerate(text.splitlines(), start=1)
-    ]
+    tracker = PkgbuildContextTracker()
+    lines: list[SourceLine] = []
+
+    for index, line in enumerate(text.splitlines(), start=1):
+        lines.append(
+            SourceLine(
+                line_number=index,
+                content=line,
+                filename=filename,
+                source_type="file",
+                function_name=tracker.annotate(line),
+            )
+        )
+
+    return lines
 
 
 def _filename_from_diff_header(line: str) -> str | None:
@@ -34,11 +83,13 @@ def source_lines_from_diff(text: str, filename: str | None = None) -> list[Sourc
     lines: list[SourceLine] = []
     current_filename = filename
     target_line_number: int | None = None
+    tracker = PkgbuildContextTracker()
 
     for index, line in enumerate(text.splitlines(), start=1):
         if line.startswith("diff --git "):
             current_filename = filename
             target_line_number = None
+            tracker = PkgbuildContextTracker()
             continue
 
         if line.startswith("+++"):
@@ -48,21 +99,24 @@ def source_lines_from_diff(text: str, filename: str | None = None) -> list[Sourc
         hunk_match = HUNK_HEADER_RE.match(line)
         if hunk_match:
             target_line_number = int(hunk_match.group(1))
+            tracker = PkgbuildContextTracker()
             continue
 
         if target_line_number is None:
             continue
 
         if line.startswith("+"):
+            content = line[1:]
             lines.append(
                 SourceLine(
                     line_number=target_line_number,
-                    content=line[1:],
+                    content=content,
                     filename=current_filename,
                     source_type="diff",
                     diff_line_number=index,
                     target_line_number=target_line_number,
                     change_type="added",
+                    function_name=tracker.annotate(content),
                 )
             )
             target_line_number += 1
@@ -74,6 +128,8 @@ def source_lines_from_diff(text: str, filename: str | None = None) -> list[Sourc
         if line.startswith("\\"):
             continue
 
+        context_content = line[1:] if line.startswith(" ") else line
+        tracker.annotate(context_content)
         target_line_number += 1
 
     return lines
@@ -86,8 +142,10 @@ def scan_lines(
     findings: list[Finding] = []
 
     for line in lines:
+        if _is_full_line_comment(line.content):
+            continue
         for rule in rules:
-            if rule.pattern.search(line.content):
+            if rule.matches(line):
                 findings.append(
                     Finding(
                         rule_id=rule.id,
@@ -101,6 +159,7 @@ def scan_lines(
                         diff_line_number=line.diff_line_number,
                         target_line_number=line.target_line_number,
                         change_type=line.change_type,
+                        function_name=line.function_name,
                     )
                 )
 

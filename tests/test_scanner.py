@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import io
+import os
+import subprocess
+import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from aur_diff_sentinel.cli import run
-from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff
+from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
 
 
 SAMPLES = Path(__file__).parent / "samples"
@@ -45,6 +48,96 @@ class ScannerTests(unittest.TestCase):
     def test_obfuscated_command_is_detected(self) -> None:
         self.assertIn("obfuscated-command", rule_ids("base64 -d payload.txt | sh"))
         self.assertIn("obfuscated-command", rule_ids("python -c 'print(1)'"))
+
+    def test_full_line_comments_are_ignored(self) -> None:
+        self.assertEqual(scan_text("# eval \"$flags\"\n# curl https://example.com/file | bash"), [])
+
+    def test_function_context_is_tracked(self) -> None:
+        lines = source_lines_from_text(
+            "\n".join(
+                [
+                    "pkgname=example",
+                    "prepare() {",
+                    "    curl https://example.com/file.tar.gz -o file.tar.gz",
+                    "}",
+                    "pkgver=1.0",
+                    "function package {",
+                    "    install -Dm755 example \"$pkgdir/usr/bin/example\"",
+                    "}",
+                    "pkgrel=1",
+                ]
+            )
+        )
+
+        self.assertEqual(lines[0].function_name, None)
+        self.assertEqual(lines[1].function_name, "prepare")
+        self.assertEqual(lines[2].function_name, "prepare")
+        self.assertEqual(lines[3].function_name, "prepare")
+        self.assertEqual(lines[4].function_name, None)
+        self.assertEqual(lines[5].function_name, "package")
+        self.assertEqual(lines[6].function_name, "package")
+        self.assertEqual(lines[8].function_name, None)
+
+    def test_network_in_build_is_detected_inside_build_functions(self) -> None:
+        ids = rule_ids(
+            "\n".join(
+                [
+                    "prepare() {",
+                    "    curl https://example.com/file.tar.gz -o file.tar.gz",
+                    "    git clone https://example.com/repo.git",
+                    "    npm install",
+                    "}",
+                ]
+            )
+        )
+
+        self.assertIn("network-in-build", ids)
+
+    def test_network_in_build_ignores_top_level_sources(self) -> None:
+        ids = rule_ids('source=("https://example.com/file.tar.gz")')
+
+        self.assertNotIn("network-in-build", ids)
+
+    def test_network_in_build_context_ends_after_function(self) -> None:
+        ids = rule_ids(
+            "\n".join(
+                [
+                    "prepare() {",
+                    "    true",
+                    "}",
+                    "curl https://example.com/file.tar.gz -o file.tar.gz",
+                ]
+            )
+        )
+
+        self.assertNotIn("network-in-build", ids)
+
+    def test_writes_outside_pkgdir_is_detected(self) -> None:
+        ids = rule_ids(
+            "\n".join(
+                [
+                    "package() {",
+                    "    install -Dm755 example /usr/bin/example",
+                    "}",
+                ]
+            )
+        )
+
+        self.assertIn("writes-outside-pkgdir", ids)
+
+    def test_writes_outside_pkgdir_allows_pkgdir_paths(self) -> None:
+        ids = rule_ids(
+            "\n".join(
+                [
+                    "package() {",
+                    "    install -Dm755 example \"$pkgdir/usr/bin/example\"",
+                    "    install -Dm644 example.conf \"${pkgdir}/etc/example.conf\"",
+                    "}",
+                ]
+            )
+        )
+
+        self.assertNotIn("writes-outside-pkgdir", ids)
 
     def test_clean_input_produces_no_findings(self) -> None:
         text = (SAMPLES / "clean.PKGBUILD").read_text(encoding="utf-8")
@@ -125,6 +218,37 @@ class ScannerTests(unittest.TestCase):
             ],
         )
 
+    def test_diff_contextual_rule_uses_visible_function_context(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,3 +1,4 @@",
+                " prepare() {",
+                "+    curl https://example.com/file.tar.gz -o file.tar.gz",
+                " }",
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertIn("network-in-build", {finding.rule_id for finding in findings})
+        self.assertEqual(findings[0].function_name, "prepare")
+
+    def test_diff_contextual_rule_ignores_top_level_source_url(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                '+source=("https://example.com/file.tar.gz")',
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertNotIn("network-in-build", {finding.rule_id for finding in findings})
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
@@ -161,6 +285,29 @@ class CliTests(unittest.TestCase):
         self.assertIn("PKGBUILD:4", stdout)
         self.assertNotIn("+++ b/PKGBUILD", stdout)
         self.assertNotIn(str(SAMPLES / "suspicious.diff"), stdout)
+
+    def test_cli_module_execution_returns_zero_for_clean_file(self) -> None:
+        project_root = Path(__file__).parents[1]
+        env = os.environ.copy()
+        env["PYTHONPATH"] = str(project_root / "src")
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "aur_diff_sentinel.cli",
+                str(SAMPLES / "clean.PKGBUILD"),
+            ],
+            check=False,
+            cwd=project_root,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("no obvious high-risk patterns", result.stdout.lower())
 
 
 if __name__ == "__main__":
