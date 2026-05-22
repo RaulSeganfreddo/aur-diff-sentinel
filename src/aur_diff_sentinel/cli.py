@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import sys
 from pathlib import Path
 from typing import TextIO
@@ -27,11 +28,14 @@ scan options:
   --verbose         show matched source lines and rule hints
 """
 
+COMMANDS = ("updates", "baseline")
+
 
 def build_scan_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aur-diff-sentinel",
         description="Highlight suspicious patterns in AUR PKGBUILDs and diffs.",
+        allow_abbrev=False,
     )
     parser.add_argument("path", help="PKGBUILD-like file or unified diff to scan")
     parser.add_argument(
@@ -51,6 +55,7 @@ def build_updates_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aur-diff-sentinel updates",
         description="Review pending AUR updates without installing them.",
+        allow_abbrev=False,
     )
     parser.add_argument(
         "--helper",
@@ -74,6 +79,7 @@ def build_baseline_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="aur-diff-sentinel baseline",
         description="Manage aur-diff-sentinel review baselines.",
+        allow_abbrev=False,
     )
     subparsers = parser.add_subparsers(dest="baseline_command", required=True)
     refresh = subparsers.add_parser(
@@ -117,12 +123,28 @@ def run(
         return 0
 
     if argv and argv[0] == "updates":
-        return _run_updates(argv[1:], stdout=stdout, stderr=stderr)
+        try:
+            return _run_updates(argv[1:], stdout=stdout, stderr=stderr)
+        except SystemExit as exc:
+            return int(exc.code or 0)
     if argv and argv[0] == "baseline":
-        return _run_baseline(argv[1:], stdout=stdout, stderr=stderr)
+        try:
+            return _run_baseline(argv[1:], stdout=stdout, stderr=stderr)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+    if argv and _looks_like_command_typo(argv[0]):
+        suggestion = difflib.get_close_matches(argv[0], COMMANDS, n=1)[0]
+        print(
+            f"aur-diff-sentinel: unknown command '{argv[0]}'; did you mean '{suggestion}'?",
+            file=stderr,
+        )
+        return 2
 
     parser = build_scan_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        return int(exc.code or 0)
     path = Path(args.path)
 
     try:
@@ -195,6 +217,12 @@ def _run_baseline(
 
 def main() -> None:
     raise SystemExit(run())
+
+
+def _looks_like_command_typo(value: str) -> bool:
+    if value.startswith("-") or "/" in value or "\\" in value or "." in value:
+        return False
+    return bool(difflib.get_close_matches(value, COMMANDS, n=1))
 
 
 if __name__ == "__main__":

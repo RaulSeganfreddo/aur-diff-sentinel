@@ -832,6 +832,38 @@ class UpdatesCliTests(unittest.TestCase):
         self.assertIn("No AUR updates found.", stdout)
         self.assertIn("No packages were updated.", stdout)
 
+    def test_updates_verbose_is_accepted(self) -> None:
+        with patch("aur_diff_sentinel.cli.discover_updates", return_value=[]):
+            exit_code, stdout, stderr = self.run_cli(["updates", "--verbose"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No AUR updates found.", stdout)
+
+    def test_updates_rejects_abbreviated_verbose_flag(self) -> None:
+        exit_code, _stdout, stderr = self.run_cli(["updates", "--verbos"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("unrecognized arguments: --verbos", stderr)
+
+    def test_update_typo_suggests_updates_command(self) -> None:
+        exit_code, _stdout, stderr = self.run_cli(["update"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("unknown command 'update'; did you mean 'updates'?", stderr)
+
+    def test_baseline_typo_suggests_baseline_command(self) -> None:
+        exit_code, _stdout, stderr = self.run_cli(["baselinee"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("unknown command 'baselinee'; did you mean 'baseline'?", stderr)
+
+    def test_missing_file_still_reports_cannot_read(self) -> None:
+        exit_code, _stdout, stderr = self.run_cli([str(SAMPLES / "missing.PKGBUILD")])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("cannot read", stderr)
+
     def test_top_level_help_mentions_update_commands(self) -> None:
         exit_code, stdout, stderr = self.run_cli(["--help"])
 
