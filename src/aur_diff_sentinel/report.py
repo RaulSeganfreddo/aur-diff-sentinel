@@ -22,6 +22,10 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
                 lines.append(_format_finding(finding))
                 if verbose:
                     lines.append(f"  line: {finding.line_content}")
+                    if finding.old_value is not None:
+                        lines.append(f"  old: {finding.old_value}")
+                    if finding.new_value is not None:
+                        lines.append(f"  new: {finding.new_value}")
                     if finding.hint:
                         lines.append(f"  hint: {finding.hint}")
             lines.append("")
@@ -35,7 +39,7 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
 
 
 def _format_finding(finding: Finding) -> str:
-    return f"- {_location(finding)} {finding.rule_id:<22} {finding.message}"
+    return f"- {_location(finding)} {finding.rule_id:<26} {finding.message}"
 
 
 def _location(finding: Finding) -> str:

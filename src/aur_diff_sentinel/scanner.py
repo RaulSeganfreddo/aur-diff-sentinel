@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable, Sequence
 
+from aur_diff_sentinel.diff_analysis import analyze_source_diff
 from aur_diff_sentinel.models import Finding, Rule, SourceLine
 from aur_diff_sentinel.rules import RULES
 
@@ -179,4 +180,6 @@ def scan_diff_text(
     rules: Sequence[Rule] = RULES,
     filename: str | None = None,
 ) -> list[Finding]:
-    return scan_lines(source_lines_from_diff(text, filename=filename), rules=rules)
+    findings = scan_lines(source_lines_from_diff(text, filename=filename), rules=rules)
+    findings.extend(analyze_source_diff(text))
+    return findings

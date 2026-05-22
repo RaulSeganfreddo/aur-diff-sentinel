@@ -30,6 +30,7 @@ pip install -e .
 aur-diff-sentinel PKGBUILD
 aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
+aur-diff-sentinel --diff --verbose update.diff
 ```
 
 Typical workflow:
@@ -39,7 +40,8 @@ aur-diff-sentinel --diff update.diff
 ```
 
 In `--diff` mode, it scans added lines from unified diffs and reports findings
-against the target file and line number when hunk metadata is available.
+against the target file and line number when hunk metadata is available. It also
+compares simple source and checksum changes in `PKGBUILD` diffs.
 
 ## What it looks for
 
@@ -56,6 +58,10 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - obvious obfuscated command execution
 - network activity inside build functions
 - obvious writes outside `$pkgdir`
+- newly added source URLs in diffs
+- source domain changes in diffs
+- HTTPS-to-HTTP source URL downgrades in diffs
+- newly added `SKIP` checksums in diffs
 
 ## Output
 
@@ -74,6 +80,7 @@ Verdict: manual review strongly recommended.
 ```
 
 Use `--verbose` to include matched source lines and rule hints.
+For source comparison findings, verbose output also includes old and new values.
 
 ## Exit codes
 
@@ -91,5 +98,6 @@ Important limits:
 - it uses regexes and lightweight context, not a full Bash parser
 - it can produce false positives
 - it can miss subtle or heavily obfuscated shell logic
+- it only compares simple source and checksum arrays
 - it does not inspect downloaded source archives
 - it does not prove that a package is safe

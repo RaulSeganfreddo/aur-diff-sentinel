@@ -250,6 +250,68 @@ class ScannerTests(unittest.TestCase):
 
         self.assertNotIn("network-in-build", {finding.rule_id for finding in findings})
 
+    def test_diff_source_change_findings_are_detected(self) -> None:
+        text = (SAMPLES / "source-change.diff").read_text(encoding="utf-8")
+        findings = scan_diff_text(text)
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("https-to-http-downgrade", ids)
+        self.assertIn("source-domain-changed", ids)
+        self.assertIn("source-url-added", ids)
+        self.assertIn("checksum-skip-added", ids)
+
+    def test_diff_source_change_findings_keep_old_and_new_values(self) -> None:
+        text = (SAMPLES / "source-change.diff").read_text(encoding="utf-8")
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "source-domain-changed"
+        )
+
+        self.assertEqual(
+            finding.old_value,
+            "https://github.com/example/app/archive/v1.0.tar.gz",
+        )
+        self.assertEqual(
+            finding.new_value,
+            "http://downloads.example.net/app/v1.0.tar.gz",
+        )
+        self.assertEqual(finding.filename, "PKGBUILD")
+        self.assertEqual(finding.line_number, 3)
+
+    def test_diff_source_comparison_ignores_non_pkgbuild_files(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/example.install b/example.install",
+                "--- a/example.install",
+                "+++ b/example.install",
+                "@@ -1 +1 @@",
+                '-source=("https://github.com/example/app.tar.gz")',
+                '+source=("http://strange.example/app.tar.gz")',
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertNotIn("source-domain-changed", ids)
+        self.assertNotIn("https-to-http-downgrade", ids)
+
+    def test_diff_multiline_source_arrays_are_compared(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,5 +1,5 @@",
+                " source=(",
+                '-  "https://github.com/example/app.tar.gz"',
+                '+  "https://mirror.example/app.tar.gz"',
+                " )",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertIn("source-domain-changed", ids)
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
@@ -291,6 +353,15 @@ class CliTests(unittest.TestCase):
         self.assertIn("PKGBUILD:4", stdout)
         self.assertNotIn("+++ b/PKGBUILD", stdout)
         self.assertNotIn(str(SAMPLES / "suspicious.diff"), stdout)
+
+    def test_cli_diff_mode_reports_source_comparison_findings(self) -> None:
+        exit_code, stdout, _stderr = self.run_cli(["--diff", str(SAMPLES / "source-change.diff")])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("https-to-http-downgrade", stdout)
+        self.assertIn("source-domain-changed", stdout)
+        self.assertIn("source-url-added", stdout)
+        self.assertIn("checksum-skip-added", stdout)
 
     def test_cli_verbose_shows_lines_and_hints(self) -> None:
         exit_code, stdout, _stderr = self.run_cli(["--verbose", str(SAMPLES / "suspicious.PKGBUILD")])
@@ -368,6 +439,13 @@ class ReportTests(unittest.TestCase):
 
         self.assertIn("line: sha256sums=('SKIP')", report)
         self.assertIn("hint: SKIP can be legitimate", report)
+
+    def test_verbose_report_includes_old_and_new_values(self) -> None:
+        findings = scan_diff_text((SAMPLES / "source-change.diff").read_text(encoding="utf-8"))
+        report = format_findings(findings, verbose=True)
+
+        self.assertIn("old: https://github.com/example/app/archive/v1.0.tar.gz", report)
+        self.assertIn("new: http://downloads.example.net/app/v1.0.tar.gz", report)
 
 
 if __name__ == "__main__":

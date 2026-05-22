@@ -94,3 +94,5 @@ class Finding:
     target_line_number: int | None = None
     change_type: str | None = None
     function_name: str | None = None
+    old_value: str | None = None
+    new_value: str | None = None
