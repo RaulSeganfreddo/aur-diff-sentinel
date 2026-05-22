@@ -163,7 +163,7 @@ class ScannerTests(unittest.TestCase):
         text = (SAMPLES / "suspicious.diff").read_text(encoding="utf-8")
         ids = {finding.rule_id for finding in scan_diff_text(text)}
 
-        self.assertIn("checksum-skip", ids)
+        self.assertIn("checksum-skip-added", ids)
         self.assertIn("eval-used", ids)
         self.assertIn("setuid-permission", ids)
 
@@ -317,6 +317,108 @@ class ScannerTests(unittest.TestCase):
         ids = {finding.rule_id for finding in scan_diff_text(text)}
 
         self.assertIn("source-domain-changed", ids)
+
+    def test_diff_removed_checksum_array_is_detected(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,4 +1,3 @@",
+                " pkgname=example",
+                " source=(\"https://example.com/app.tar.gz\")",
+                "-sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+                " package() {",
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertIn("checksum-array-removed", {finding.rule_id for finding in findings})
+
+    def test_diff_checksum_algorithm_weakening_is_detected(self) -> None:
+        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
+        findings = scan_diff_text(text)
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("checksum-algorithm-weakened", ids)
+        self.assertNotIn("checksum-array-removed", ids)
+
+    def test_diff_checksum_algorithm_strengthening_is_ignored(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,4 +1,4 @@",
+                " pkgname=example",
+                " source=(\"https://example.com/app.tar.gz\")",
+                "-md5sums=('abcdef0123456789abcdef0123456789')",
+                "+sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertNotIn("checksum-algorithm-weakened", {finding.rule_id for finding in findings})
+
+    def test_diff_checksum_count_mismatch_is_detected(self) -> None:
+        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "checksum-count-mismatch"
+        )
+
+        self.assertEqual(finding.severity.value, "MEDIUM")
+        self.assertEqual(finding.old_value, "2")
+        self.assertEqual(finding.new_value, "1")
+
+    def test_diff_checksum_count_mismatch_matches_arch_suffixes(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,7 +1,7 @@",
+                " pkgname=example",
+                " source=(\"https://example.com/common.tar.gz\")",
+                " sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+                " source_x86_64=(\"https://example.com/bin.tar.gz\")",
+                "-sha256sums_x86_64=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
+                "+sha256sums_x86_64=('SKIP')",
+            ]
+        )
+        findings = scan_diff_text(text)
+
+        self.assertNotIn("checksum-count-mismatch", {finding.rule_id for finding in findings})
+
+    def test_diff_vcs_checksum_skip_is_medium_without_duplicate_high(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,4 +1,4 @@",
+                " pkgname=example-git",
+                " source=(\"git+https://example.com/app.git\")",
+                "-sha256sums=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
+                "+sha256sums=('SKIP')",
+            ]
+        )
+        findings = scan_diff_text(text)
+        skip_findings = [finding for finding in findings if "checksum-skip" in finding.rule_id]
+
+        self.assertEqual([finding.rule_id for finding in skip_findings], ["checksum-skip-added"])
+        self.assertEqual(skip_findings[0].severity.value, "MEDIUM")
+
+    def test_diff_non_vcs_checksum_skip_stays_high(self) -> None:
+        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "checksum-skip-added"
+        )
+
+        self.assertEqual(finding.severity.value, "HIGH")
 
 
 class CliTests(unittest.TestCase):

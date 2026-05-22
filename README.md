@@ -71,6 +71,10 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - source domain changes in diffs
 - HTTPS-to-HTTP source URL downgrades in diffs
 - newly added `SKIP` checksums in diffs
+- removed checksum arrays in diffs
+- checksum algorithm weakening in diffs
+- source/checksum count mismatches in diffs
+- VCS checksum `SKIP` cases at lower severity in diffs
 - pending AUR updates discovered through `paru` or `yay`
 
 ## Output
@@ -90,7 +94,7 @@ Verdict: manual review strongly recommended.
 ```
 
 Use `--verbose` to include matched source lines and rule hints.
-For source comparison findings, verbose output also includes old and new values.
+For source and checksum comparison findings, verbose output also includes old and new values.
 
 When using `updates`, the output is grouped by package and always ends by making
 clear that no packages were updated.
@@ -112,6 +116,7 @@ Important limits:
 - it can produce false positives
 - it can miss subtle or heavily obfuscated shell logic
 - it only compares simple source and checksum arrays
+- checksum consistency checks are conservative and diff-focused
 - it relies on `paru` or `yay` only for update discovery
 - it does not inspect downloaded source archives
 - it does not install, build, or update packages

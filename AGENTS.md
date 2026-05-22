@@ -43,5 +43,10 @@ Keep cache paths configurable with `--cache-dir`.
 
 ## Tests
 Tests use `unittest.TestCase` and run with `pytest`.
+When `.venv/` exists, prefer running tests through the project virtualenv:
+
+    .venv/bin/python -m pytest
+
+If plain `pytest` or `python -m pytest` is unavailable, try the venv before assuming test dependencies are missing.
 Add tests for both detections and false-positive guards.
 Do not use real network, real AUR helpers, or real `git clone` in tests. Mock or inject those dependencies.

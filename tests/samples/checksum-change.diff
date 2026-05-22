@@ -1,0 +1,15 @@
+diff --git a/PKGBUILD b/PKGBUILD
+index 1111111..2222222 100644
+--- a/PKGBUILD
++++ b/PKGBUILD
+@@ -1,7 +1,8 @@
+ pkgname=example
+ pkgver=1.0
+-source=("https://example.com/app.tar.gz")
+-sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')
++source=("https://example.com/app.tar.gz"
++        "https://example.com/extra.patch")
++md5sums=('SKIP')
+ 
+ package() {
+     install -Dm755 example "$pkgdir/usr/bin/example"

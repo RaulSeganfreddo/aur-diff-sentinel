@@ -180,6 +180,19 @@ def scan_diff_text(
     rules: Sequence[Rule] = RULES,
     filename: str | None = None,
 ) -> list[Finding]:
-    findings = scan_lines(source_lines_from_diff(text, filename=filename), rules=rules)
-    findings.extend(analyze_source_diff(text))
-    return findings
+    line_findings = scan_lines(source_lines_from_diff(text, filename=filename), rules=rules)
+    diff_findings = analyze_source_diff(text)
+    contextual_skip_locations = {
+        (finding.filename, finding.line_number)
+        for finding in diff_findings
+        if finding.rule_id == "checksum-skip-added"
+    }
+    filtered_line_findings = [
+        finding
+        for finding in line_findings
+        if not (
+            finding.rule_id == "checksum-skip"
+            and (finding.filename, finding.line_number) in contextual_skip_locations
+        )
+    ]
+    return [*filtered_line_findings, *diff_findings]
