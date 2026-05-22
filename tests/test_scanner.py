@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
+from aur_diff_sentinel.cache import AurCache, metadata_version
 from aur_diff_sentinel.cli import run
+from aur_diff_sentinel.provider import AurUpdate, discover_updates, parse_update_output
 from aur_diff_sentinel.report import format_findings
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
+from aur_diff_sentinel.update_review import review_updates
 
 
 SAMPLES = Path(__file__).parent / "samples"
@@ -446,6 +452,246 @@ class ReportTests(unittest.TestCase):
 
         self.assertIn("old: https://github.com/example/app/archive/v1.0.tar.gz", report)
         self.assertIn("new: http://downloads.example.net/app/v1.0.tar.gz", report)
+
+
+class ProviderTests(unittest.TestCase):
+    def test_parse_update_output_handles_empty_output(self) -> None:
+        self.assertEqual(parse_update_output(""), [])
+
+    def test_parse_update_output_handles_arrow_format(self) -> None:
+        updates = parse_update_output("example-bin 1.0-1 -> 1.1-1\nfoo-git 2-1 -> 3-1\n")
+
+        self.assertEqual(
+            updates,
+            [
+                AurUpdate("example-bin", "1.0-1", "1.1-1"),
+                AurUpdate("foo-git", "2-1", "3-1"),
+            ],
+        )
+
+    def test_discover_updates_uses_injected_runner(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            self.assertEqual(command, ["paru", "-Qua"])
+            return subprocess.CompletedProcess(command, 0, "example-bin 1.0-1 -> 1.1-1\n", "")
+
+        self.assertEqual(
+            discover_updates("paru", runner=runner),
+            [AurUpdate("example-bin", "1.0-1", "1.1-1")],
+        )
+
+    def test_discover_updates_reports_helper_error(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "helper failed")
+
+        with self.assertRaisesRegex(RuntimeError, "helper failed"):
+            discover_updates("paru", runner=runner)
+
+    def test_discover_updates_treats_empty_nonzero_output_as_no_updates(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "")
+
+        self.assertEqual(discover_updates("paru", runner=runner), [])
+
+
+class UpdateWorkflowTests(unittest.TestCase):
+    def test_metadata_version_reads_srcinfo_and_pkgbuild_shapes(self) -> None:
+        self.assertEqual(metadata_version("pkgver = 1.0\npkgrel = 2\n"), "1.0-2")
+        self.assertEqual(metadata_version("pkgver=1.0\npkgrel=2\n"), "1.0-2")
+
+    def test_updates_do_not_advance_existing_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"))
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+
+            result = review_updates([update], cache)
+
+            self.assertTrue(result.has_findings)
+            self.assertFalse(result.reviews[0].baseline_refreshed)
+            self.assertIn("pkgver=1.0", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_missing_baseline_scans_latest_without_initializing_to_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(
+                Path(temp_dir),
+                fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"),
+            )
+
+            result = review_updates([update], cache)
+
+            self.assertTrue(result.has_findings)
+            self.assertFalse(cache.has_baseline(update.package))
+            self.assertIn("no update diff was reviewed", " ".join(result.reviews[0].notes).lower())
+
+    def test_missing_baseline_is_reconstructed_from_installed_version_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            _run_git(repo, "init")
+            _run_git(repo, "config", "user.email", "test@example.invalid")
+            _run_git(repo, "config", "user.name", "Test User")
+            (repo / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+            _run_git(repo, "add", "PKGBUILD")
+            _run_git(repo, "commit", "-m", "old")
+            (repo / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.1\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+            _run_git(repo, "commit", "-am", "new")
+
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root / "cache", fetcher=_copy_repo_fetcher(repo))
+
+            result = review_updates([update], cache)
+
+            self.assertTrue(cache.has_baseline(update.package))
+            self.assertIn(
+                "pkgver=1.0",
+                (cache.baseline_dir(update.package) / "PKGBUILD").read_text(encoding="utf-8"),
+            )
+            self.assertIn("Initialized review baseline", " ".join(result.reviews[0].notes))
+
+    def test_refresh_baseline_is_blocked_when_findings_exist(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"))
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+
+            result = review_updates([update], cache, refresh_baseline=True)
+
+            self.assertTrue(result.refresh_blocked)
+            self.assertIn("pkgver=1.0", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_force_refresh_updates_baseline_even_with_findings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"))
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+
+            result = review_updates([update], cache, refresh_baseline=True, force=True)
+
+            self.assertFalse(result.refresh_blocked)
+            self.assertTrue(result.reviews[0].baseline_refreshed)
+            self.assertIn("pkgver=1.1", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
+
+
+class UpdatesCliTests(unittest.TestCase):
+    def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            exit_code = run(argv)
+        return exit_code, stdout.getvalue(), stderr.getvalue()
+
+    def test_updates_no_updates_returns_zero(self) -> None:
+        with patch("aur_diff_sentinel.cli.discover_updates", return_value=[]):
+            exit_code, stdout, stderr = self.run_cli(["updates"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("No AUR updates found.", stdout)
+        self.assertIn("No packages were updated.", stdout)
+
+    def test_top_level_help_mentions_update_commands(self) -> None:
+        exit_code, stdout, stderr = self.run_cli(["--help"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("updates", stdout)
+        self.assertIn("baseline refresh", stdout)
+
+    def test_updates_helper_error_returns_two(self) -> None:
+        with patch("aur_diff_sentinel.cli.discover_updates", side_effect=RuntimeError("no helper")):
+            exit_code, _stdout, stderr = self.run_cli(["updates"])
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("no helper", stderr)
+
+    def test_baseline_refresh_blocked_message_mentions_force(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"))
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+
+            with (
+                patch("aur_diff_sentinel.cli.discover_updates", return_value=[update]),
+                patch("aur_diff_sentinel.cli.AurCache", return_value=cache),
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "refresh", "--cache-dir", str(root)]
+                )
+
+        self.assertEqual(exit_code, 2)
+        self.assertEqual(stderr, "")
+        self.assertIn("review baselines were not refreshed", stdout)
+        self.assertIn("baseline refresh --force", stdout)
+        self.assertIn("No packages were updated.", stdout)
+
+
+def _fixture_fetcher(pkgver: str, pkgrel: str, extra_line: str):
+    def fetcher(update: AurUpdate, target: Path) -> None:
+        target.mkdir(parents=True)
+        (target / "PKGBUILD").write_text(
+            "\n".join(
+                [
+                    f"pkgname={update.package}",
+                    f"pkgver={pkgver}",
+                    f"pkgrel={pkgrel}",
+                    extra_line,
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    return fetcher
+
+
+def _copy_repo_fetcher(source: Path):
+    def fetcher(_update: AurUpdate, target: Path) -> None:
+        shutil.copytree(source, target)
+
+    return fetcher
+
+
+def _run_git(repo: Path, *args: str) -> None:
+    result = subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise AssertionError(result.stderr or result.stdout)
 
 
 if __name__ == "__main__":

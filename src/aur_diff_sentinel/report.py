@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 
 from aur_diff_sentinel.models import Finding, Severity
+from aur_diff_sentinel.update_review import UpdateReviewResult
 
 
 def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
@@ -36,6 +37,49 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
         lines.append("Manual review is still recommended.")
 
     return "\n".join(lines)
+
+
+def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -> str:
+    if not result.reviews:
+        return "\n".join(
+            [
+                "No AUR updates found.",
+                "No packages were updated.",
+            ]
+        )
+
+    lines: list[str] = [f"AUR updates found: {len(result.reviews)}", ""]
+
+    for review in result.reviews:
+        lines.append(
+            f"{review.update.package}: {review.update.old_version} -> {review.update.new_version}"
+        )
+        for note in review.notes:
+            lines.append(f"  note: {note}")
+
+        if review.findings:
+            lines.append(_indent(format_findings(review.findings, verbose=verbose)))
+        else:
+            lines.append("  No findings.")
+        lines.append("")
+
+    if result.refresh_blocked:
+        lines.append("Findings were detected, so review baselines were not refreshed.")
+        lines.append(
+            "If you intentionally accept this state, rerun with: "
+            "aur-diff-sentinel baseline refresh --force"
+        )
+    elif result.refresh_requested:
+        lines.append("Review baselines were refreshed.")
+    else:
+        lines.append("Existing review baselines were not changed.")
+
+    lines.append("No packages were updated.")
+    return "\n".join(lines)
+
+
+def _indent(text: str) -> str:
+    return "\n".join(f"  {line}" if line else "" for line in text.splitlines())
 
 
 def _format_finding(finding: Finding) -> str:

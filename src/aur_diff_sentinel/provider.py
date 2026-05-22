@@ -1,0 +1,85 @@
+from __future__ import annotations
+
+import shutil
+import subprocess
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+
+
+CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+
+
+@dataclass(frozen=True)
+class AurUpdate:
+    package: str
+    old_version: str
+    new_version: str
+
+
+def default_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(command),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+
+def detect_helper() -> str | None:
+    for helper in ("paru", "yay"):
+        if shutil.which(helper):
+            return helper
+    return None
+
+
+def discover_updates(
+    helper: str | None = None,
+    *,
+    runner: CommandRunner = default_runner,
+) -> list[AurUpdate]:
+    selected_helper = helper or detect_helper()
+    if selected_helper is None:
+        raise RuntimeError("no supported AUR helper found; install paru or yay, or pass --helper")
+    if selected_helper not in {"paru", "yay"}:
+        raise RuntimeError(f"unsupported AUR helper: {selected_helper}")
+
+    result = runner([selected_helper, "-Qua"])
+    if result.returncode != 0:
+        error = result.stderr.strip() or result.stdout.strip() or "unknown helper error"
+        if not result.stdout.strip() and not result.stderr.strip():
+            return []
+        raise RuntimeError(f"{selected_helper} -Qua failed: {error}")
+
+    return parse_update_output(result.stdout)
+
+
+def parse_update_output(output: str) -> list[AurUpdate]:
+    updates: list[AurUpdate] = []
+
+    for line in output.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+
+        if "->" in parts:
+            arrow_index = parts.index("->")
+            if arrow_index >= 2 and arrow_index + 1 < len(parts):
+                updates.append(
+                    AurUpdate(
+                        package=parts[0],
+                        old_version=parts[arrow_index - 1],
+                        new_version=parts[arrow_index + 1],
+                    )
+                )
+                continue
+
+        if len(parts) >= 3:
+            updates.append(
+                AurUpdate(
+                    package=parts[0],
+                    old_version=parts[1],
+                    new_version=parts[2],
+                )
+            )
+
+    return updates

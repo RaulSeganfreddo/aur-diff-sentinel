@@ -31,15 +31,24 @@ aur-diff-sentinel PKGBUILD
 aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
 aur-diff-sentinel --diff --verbose update.diff
+aur-diff-sentinel updates
+aur-diff-sentinel baseline refresh
 ```
 
 Typical workflow:
 
 ```bash
-aur-diff-sentinel --diff update.diff
+aur-diff-sentinel updates
 ```
 
-In `--diff` mode, it scans added lines from unified diffs and reports findings
+The `updates` command asks `paru` or `yay` which AUR packages have updates,
+reviews cached AUR metadata against the latest AUR metadata, and reports
+findings. It does not install, build, or update packages.
+
+Use `baseline refresh` after you manually accept/update reviewed AUR metadata.
+If findings are present, refresh is blocked unless you use `--force`.
+
+In `--diff` mode, the tool scans added lines from unified diffs and reports findings
 against the target file and line number when hunk metadata is available. It also
 compares simple source and checksum changes in `PKGBUILD` diffs.
 
@@ -62,6 +71,7 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - source domain changes in diffs
 - HTTPS-to-HTTP source URL downgrades in diffs
 - newly added `SKIP` checksums in diffs
+- pending AUR updates discovered through `paru` or `yay`
 
 ## Output
 
@@ -82,6 +92,9 @@ Verdict: manual review strongly recommended.
 Use `--verbose` to include matched source lines and rule hints.
 For source comparison findings, verbose output also includes old and new values.
 
+When using `updates`, the output is grouped by package and always ends by making
+clear that no packages were updated.
+
 ## Exit codes
 
 `0` no findings, `1` findings found, `2` error.
@@ -99,5 +112,7 @@ Important limits:
 - it can produce false positives
 - it can miss subtle or heavily obfuscated shell logic
 - it only compares simple source and checksum arrays
+- it relies on `paru` or `yay` only for update discovery
 - it does not inspect downloaded source archives
+- it does not install, build, or update packages
 - it does not prove that a package is safe
