@@ -9,6 +9,7 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 from aur_diff_sentinel.cli import run
+from aur_diff_sentinel.report import format_findings
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
 
 
@@ -262,14 +263,19 @@ class CliTests(unittest.TestCase):
         exit_code, stdout, _stderr = self.run_cli([str(SAMPLES / "clean.PKGBUILD")])
 
         self.assertEqual(exit_code, 0)
+        self.assertIn("Summary: HIGH 0, MEDIUM 0, LOW 0", stdout)
         self.assertIn("no obvious high-risk patterns", stdout.lower())
 
     def test_cli_suspicious_file_returns_one(self) -> None:
         exit_code, stdout, _stderr = self.run_cli([str(SAMPLES / "suspicious.PKGBUILD")])
 
         self.assertEqual(exit_code, 1)
+        self.assertIn("HIGH\n", stdout)
+        self.assertIn("MEDIUM\n", stdout)
         self.assertIn("checksum-skip", stdout)
-        self.assertIn("Summary:", stdout)
+        self.assertIn("Summary: HIGH", stdout)
+        self.assertNotIn("hint:", stdout)
+        self.assertNotIn("line:", stdout)
 
     def test_cli_missing_file_returns_two(self) -> None:
         exit_code, _stdout, stderr = self.run_cli([str(SAMPLES / "missing.PKGBUILD")])
@@ -285,6 +291,13 @@ class CliTests(unittest.TestCase):
         self.assertIn("PKGBUILD:4", stdout)
         self.assertNotIn("+++ b/PKGBUILD", stdout)
         self.assertNotIn(str(SAMPLES / "suspicious.diff"), stdout)
+
+    def test_cli_verbose_shows_lines_and_hints(self) -> None:
+        exit_code, stdout, _stderr = self.run_cli(["--verbose", str(SAMPLES / "suspicious.PKGBUILD")])
+
+        self.assertEqual(exit_code, 1)
+        self.assertIn("line: sha256sums=('SKIP')", stdout)
+        self.assertIn("hint: SKIP can be legitimate", stdout)
 
     def test_cli_module_execution_returns_zero_for_clean_file(self) -> None:
         project_root = Path(__file__).parents[1]
@@ -308,6 +321,53 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("no obvious high-risk patterns", result.stdout.lower())
+
+
+class ReportTests(unittest.TestCase):
+    def test_clean_report_is_compact(self) -> None:
+        report = format_findings([])
+
+        self.assertEqual(
+            report,
+            "\n".join(
+                [
+                    "Summary: HIGH 0, MEDIUM 0, LOW 0",
+                    "Verdict: no obvious high-risk patterns detected.",
+                    "Manual review is still recommended.",
+                ]
+            ),
+        )
+
+    def test_default_report_groups_by_severity_without_verbose_details(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "pkgname=example",
+                    "sha256sums=('SKIP')",
+                    "install=example.install",
+                    "prepare() {",
+                    "    curl https://example.com/install.sh | bash",
+                    "}",
+                ]
+            ),
+            filename="PKGBUILD",
+        )
+        report = format_findings(findings)
+
+        self.assertLess(report.index("HIGH\n"), report.index("MEDIUM\n"))
+        self.assertIn("- PKGBUILD:2 checksum-skip", report)
+        self.assertIn("- PKGBUILD:5 network-in-build", report)
+        self.assertIn("- PKGBUILD:3 install-script", report)
+        self.assertIn("Summary: HIGH 3, MEDIUM 1, LOW 0", report)
+        self.assertNotIn("hint:", report)
+        self.assertNotIn("line:", report)
+
+    def test_verbose_report_includes_lines_and_hints(self) -> None:
+        findings = scan_text("sha256sums=('SKIP')", filename="PKGBUILD")
+        report = format_findings(findings, verbose=True)
+
+        self.assertIn("line: sha256sums=('SKIP')", report)
+        self.assertIn("hint: SKIP can be legitimate", report)
 
 
 if __name__ == "__main__":
