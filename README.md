@@ -4,6 +4,26 @@ A small CLI helper for reviewing AUR `PKGBUILD` files and update diffs.
 
 It highlights suspicious or security-relevant patterns so manual review is faster and harder to skim past. It does **not** decide whether a package is safe.
 
+## Why this exists
+
+AUR helpers can show long package diffs during updates. Those diffs may contain a
+mix of routine packaging changes and security-relevant changes such as skipped
+checksums, new install scripts, remote shell execution, or live-system commands.
+
+aur-diff-sentinel is meant to make those review points harder to miss. It is a
+triage tool: it helps you decide what to inspect first, not whether a package is
+safe.
+
+## Install from source
+
+```bash
+git clone https://github.com/RaulSeganfreddo/aur-diff-sentinel.git
+cd aur-diff-sentinel
+python -m venv .venv
+. .venv/bin/activate
+pip install -e .
+```
+
 ## Usage
 
 ```bash
@@ -12,9 +32,18 @@ aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
 ```
 
+Typical workflow:
+
+```bash
+aur-diff-sentinel --diff update.diff
+```
+
+In `--diff` mode, it scans added lines from unified diffs and reports findings
+against the target file and line number when hunk metadata is available.
+
 ## What it looks for
 
-aur-diff-sentinel uses conservative line-based checks for:
+aur-diff-sentinel uses conservative regex and lightweight context checks for:
 
 - skipped checksums
 - `eval`
@@ -27,9 +56,6 @@ aur-diff-sentinel uses conservative line-based checks for:
 - obvious obfuscated command execution
 - network activity inside build functions
 - obvious writes outside `$pkgdir`
-
-In `--diff` mode, it scans added lines from unified diffs and reports findings
-against the target file and line number when hunk metadata is available.
 
 ## Output
 
@@ -57,4 +83,13 @@ Use `--verbose` to include matched source lines and rule hints.
 
 This is a review aid, not a malware detector.
 
-No findings means only that no obvious configured patterns were detected. Manual review is still required.
+No findings means only that no obvious configured patterns were detected. Manual
+review is still required.
+
+Important limits:
+
+- it uses regexes and lightweight context, not a full Bash parser
+- it can produce false positives
+- it can miss subtle or heavily obfuscated shell logic
+- it does not inspect downloaded source archives
+- it does not prove that a package is safe
