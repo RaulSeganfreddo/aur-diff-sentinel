@@ -10,7 +10,7 @@ from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.provider import discover_updates
 from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
-from aur_diff_sentinel.update_review import refresh_cached_reviewed_baselines, review_updates
+from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_updates
 
 
 MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] PATH
@@ -200,15 +200,11 @@ def _run_baseline(
     try:
         updates = discover_updates(args.helper)
         cache = AurCache(args.cache_dir)
-        if updates:
-            result = review_updates(
-                updates,
-                cache,
-                refresh_baseline=True,
-                force=args.force,
-            )
-        else:
-            result = refresh_cached_reviewed_baselines(cache)
+        result = refresh_reviewed_baselines(
+            updates,
+            cache,
+            force=args.force,
+        )
     except RuntimeError as exc:
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2

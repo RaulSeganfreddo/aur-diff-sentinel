@@ -65,13 +65,11 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
 def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -> str:
     if not result.reviews:
         if result.refresh_requested and result.cache_refresh:
-            return "\n".join(
-                [
-                    "No pending AUR updates found.",
-                    "No reviewed cached metadata was ready to refresh.",
-                    "No packages were updated.",
-                ]
-            )
+            lines = ["No reviewed metadata was ready to refresh."]
+            if not result.pending_update_count:
+                lines.insert(0, "No pending AUR updates found.")
+            lines.append("No packages were updated.")
+            return "\n".join(lines)
         return "\n".join(
             [
                 "No AUR updates found.",
@@ -102,7 +100,9 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -
         lines.append("")
 
     if result.refresh_blocked:
-        lines.append("Findings were detected, so review baselines were not refreshed.")
+        lines.append(
+            "Findings were detected, so matching installed baselines were not refreshed."
+        )
         lines.append(
             "If you intentionally accept this state, rerun with: "
             "aur-diff-sentinel baseline refresh --force"
@@ -124,14 +124,19 @@ def _format_cache_refresh_header(result: UpdateReviewResult) -> list[str]:
     refreshed_count = sum(1 for review in result.reviews if review.baseline_refreshed)
     if refreshed_count:
         return [
-            f"Review baselines refreshed from reviewed cache: {refreshed_count}",
+            f"Review baselines refreshed: {refreshed_count}",
             "",
         ]
-    return [
-        "No pending AUR updates found.",
-        "Reviewed cached metadata was checked for refresh candidates.",
-        "",
-    ]
+    lines: list[str] = []
+    if not result.pending_update_count:
+        lines.append("No pending AUR updates found.")
+    lines.extend(
+        [
+            "Reviewed metadata was checked for refresh candidates.",
+            "",
+        ]
+    )
+    return lines
 
 
 def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:

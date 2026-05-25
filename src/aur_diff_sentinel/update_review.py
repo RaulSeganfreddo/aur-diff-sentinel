@@ -13,6 +13,12 @@ from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 InstalledVersionGetter = Callable[[str], str | None]
 
 
+@dataclass(frozen=True)
+class RefreshCandidate:
+    update: AurUpdate
+    latest_dir: Path
+
+
 @dataclass
 class PackageReview:
     update: AurUpdate
@@ -29,6 +35,7 @@ class UpdateReviewResult:
     refresh_requested: bool = False
     force_refresh: bool = False
     cache_refresh: bool = False
+    pending_update_count: int = 0
 
     @property
     def findings(self) -> list[Finding]:
@@ -50,9 +57,6 @@ class UpdateReviewResult:
 def review_updates(
     updates: list[AurUpdate],
     cache: AurCache,
-    *,
-    refresh_baseline: bool = False,
-    force: bool = False,
 ) -> UpdateReviewResult:
     reviews: list[PackageReview] = []
 
@@ -83,20 +87,9 @@ def review_updates(
         else:
             review.findings = _scan_latest_metadata(latest_dir)
 
-        if refresh_baseline:
-            if review.findings and not force:
-                review.refresh_blocked = True
-            else:
-                cache.refresh_baseline(update, latest_dir)
-                review.baseline_refreshed = True
-
         reviews.append(review)
 
-    return UpdateReviewResult(
-        reviews=reviews,
-        refresh_requested=refresh_baseline,
-        force_refresh=force,
-    )
+    return UpdateReviewResult(reviews=reviews)
 
 
 def refresh_cached_reviewed_baselines(
@@ -104,49 +97,117 @@ def refresh_cached_reviewed_baselines(
     *,
     installed_version_getter: InstalledVersionGetter | None = None,
 ) -> UpdateReviewResult:
-    reviews: list[PackageReview] = []
+    return refresh_reviewed_baselines(
+        [],
+        cache,
+        installed_version_getter=installed_version_getter,
+    )
+
+
+def refresh_reviewed_baselines(
+    updates: list[AurUpdate],
+    cache: AurCache,
+    *,
+    force: bool = False,
+    installed_version_getter: InstalledVersionGetter | None = None,
+) -> UpdateReviewResult:
     installed_version_getter = installed_version_getter or installed_version
-
-    for package in cache.reviewed_cached_packages():
-        baseline_version = cache.baseline_version(package)
-        latest_version = cache.latest_version(package)
-        if baseline_version is None or latest_version is None:
-            continue
-
-        update = AurUpdate(package, baseline_version, latest_version)
-        review = PackageReview(
-            update=update,
-            baseline_available=True,
+    candidates = _refresh_candidates(updates, cache)
+    reviews = [
+        _refresh_candidate(
+            candidate,
+            cache,
+            force=force,
+            installed_version_getter=installed_version_getter,
         )
-
-        if baseline_version == latest_version:
-            review.notes.append("Review baseline already matches cached metadata.")
-            reviews.append(review)
-            continue
-
-        current_installed_version = installed_version_getter(package)
-        if current_installed_version != latest_version:
-            if current_installed_version is None:
-                review.notes.append("Installed package version could not be determined.")
-            else:
-                review.notes.append(
-                    f"Installed version is {current_installed_version}, "
-                    f"but cached metadata is {latest_version}."
-                )
-            review.notes.append("Review baseline was not refreshed.")
-            reviews.append(review)
-            continue
-
-        cache.refresh_baseline(update, cache.latest_dir(package))
-        review.baseline_refreshed = True
-        review.notes.append("Refreshed review baseline from cached metadata.")
-        reviews.append(review)
+        for candidate in candidates
+    ]
 
     return UpdateReviewResult(
         reviews=reviews,
         refresh_requested=True,
+        force_refresh=force,
         cache_refresh=True,
+        pending_update_count=len(updates),
     )
+
+
+def _refresh_candidates(
+    updates: list[AurUpdate],
+    cache: AurCache,
+) -> list[RefreshCandidate]:
+    candidates: dict[str, RefreshCandidate] = {}
+
+    for update in updates:
+        latest_dir = cache.fetch_latest(update)
+        latest_version = cache.latest_version(update.package) or update.new_version
+        candidates[update.package] = RefreshCandidate(
+            update=AurUpdate(update.package, update.old_version, latest_version),
+            latest_dir=latest_dir,
+        )
+
+    for package in cache.reviewed_cached_packages():
+        if package in candidates:
+            continue
+        baseline_version = cache.baseline_version(package)
+        latest_version = cache.latest_version(package)
+        if baseline_version is None or latest_version is None:
+            continue
+        candidates[package] = RefreshCandidate(
+            update=AurUpdate(package, baseline_version, latest_version),
+            latest_dir=cache.latest_dir(package),
+        )
+
+    return list(candidates.values())
+
+
+def _refresh_candidate(
+    candidate: RefreshCandidate,
+    cache: AurCache,
+    *,
+    force: bool,
+    installed_version_getter: InstalledVersionGetter,
+) -> PackageReview:
+    update = candidate.update
+    review = PackageReview(
+        update=update,
+        baseline_available=cache.has_baseline(update.package),
+    )
+
+    if not review.baseline_available:
+        review.notes.append("No review baseline exists for this package.")
+        review.notes.append("Review baseline was not refreshed.")
+        return review
+
+    if update.old_version == update.new_version:
+        review.notes.append("Review baseline already matches reviewed metadata.")
+        return review
+
+    current_installed_version = installed_version_getter(update.package)
+    if current_installed_version != update.new_version:
+        if current_installed_version is None:
+            review.notes.append("Installed package version could not be determined.")
+        else:
+            review.notes.append(
+                f"Installed version is {current_installed_version}, "
+                f"but reviewed metadata is {update.new_version}."
+            )
+        review.notes.append("Review baseline was not refreshed.")
+        return review
+
+    diff_text = cache.diff_baseline_to_latest(update.package, candidate.latest_dir)
+    review.findings = scan_diff_text(diff_text) if diff_text else []
+    if review.findings and not force:
+        review.refresh_blocked = True
+        review.notes.append("Review baseline was not refreshed.")
+        return review
+
+    cache.refresh_baseline(update, candidate.latest_dir)
+    review.baseline_refreshed = True
+    review.notes.append(
+        f"Refreshed review baseline for installed version {update.new_version}."
+    )
+    return review
 
 
 def _scan_latest_metadata(latest_dir: Path) -> list[Finding]:
