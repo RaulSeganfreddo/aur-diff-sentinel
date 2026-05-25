@@ -53,6 +53,21 @@ def discover_updates(
     return parse_update_output(result.stdout)
 
 
+def installed_version(
+    package: str,
+    *,
+    runner: CommandRunner = default_runner,
+) -> str | None:
+    result = runner(["pacman", "-Q", package])
+    if result.returncode != 0:
+        return None
+
+    parts = result.stdout.split()
+    if len(parts) >= 2 and parts[0] == package:
+        return parts[1]
+    return None
+
+
 def parse_update_output(output: str) -> list[AurUpdate]:
     updates: list[AurUpdate] = []
 

@@ -17,7 +17,12 @@ from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import AurUpdate, discover_updates, parse_update_output
 from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
-from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult, review_updates
+from aur_diff_sentinel.update_review import (
+    PackageReview,
+    UpdateReviewResult,
+    refresh_cached_reviewed_baselines,
+    review_updates,
+)
 
 
 SAMPLES = Path(__file__).parent / "samples"
@@ -556,6 +561,44 @@ class ReportTests(unittest.TestCase):
         self.assertIn("old: https://github.com/example/app/archive/v1.0.tar.gz", report)
         self.assertIn("new: http://downloads.example.net/app/v1.0.tar.gz", report)
 
+    def test_cached_refresh_report_shows_refreshed_count(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("example-bin", "1.0-1", "1.1-1"),
+                    notes=["Refreshed review baseline from cached metadata."],
+                    baseline_refreshed=True,
+                )
+            ],
+            refresh_requested=True,
+            cache_refresh=True,
+        )
+        report = format_update_review(result)
+
+        self.assertIn("Review baselines refreshed from reviewed cache: 1", report)
+        self.assertIn("example-bin: 1.0-1 -> 1.1-1", report)
+        self.assertNotIn("Review baselines were refreshed from cached metadata.", report)
+        self.assertIn("No packages were updated.", report)
+
+    def test_cached_refresh_report_explains_no_refresh_candidates(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[],
+            refresh_requested=True,
+            cache_refresh=True,
+        )
+        report = format_update_review(result)
+
+        self.assertEqual(
+            report,
+            "\n".join(
+                [
+                    "No pending AUR updates found.",
+                    "No reviewed cached metadata was ready to refresh.",
+                    "No packages were updated.",
+                ]
+            ),
+        )
+
     def test_update_report_groups_packages_by_attention(self) -> None:
         result = UpdateReviewResult(
             reviews=[
@@ -814,6 +857,66 @@ class UpdateWorkflowTests(unittest.TestCase):
             self.assertTrue(result.reviews[0].baseline_refreshed)
             self.assertIn("pkgver=1.1", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
 
+    def test_cached_refresh_updates_baseline_when_installed_matches_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+            _write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            result = refresh_cached_reviewed_baselines(
+                cache,
+                installed_version_getter=lambda package: "1.1-1",
+            )
+
+            self.assertTrue(result.cache_refresh)
+            self.assertTrue(result.reviews[0].baseline_refreshed)
+            self.assertEqual(cache.baseline_version("example-bin"), "1.1-1")
+            self.assertIn(
+                "pkgver=1.1",
+                (cache.baseline_dir("example-bin") / "PKGBUILD").read_text(encoding="utf-8"),
+            )
+
+    def test_cached_refresh_skips_when_installed_does_not_match_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+            _write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            result = refresh_cached_reviewed_baselines(
+                cache,
+                installed_version_getter=lambda package: "1.0-1",
+            )
+
+            self.assertFalse(result.reviews[0].baseline_refreshed)
+            self.assertEqual(cache.baseline_version("example-bin"), "1.0-1")
+            self.assertIn("Review baseline was not refreshed.", result.reviews[0].notes)
+
+    def test_cached_refresh_ignores_latest_without_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            result = refresh_cached_reviewed_baselines(
+                cache,
+                installed_version_getter=lambda package: "1.1-1",
+            )
+
+            self.assertEqual(result.reviews, [])
+
+    def test_cached_refresh_skips_when_baseline_already_matches_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+            _write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.1", "1")
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            result = refresh_cached_reviewed_baselines(
+                cache,
+                installed_version_getter=lambda package: "1.1-1",
+            )
+
+            self.assertFalse(result.reviews[0].baseline_refreshed)
+            self.assertIn("already matches", result.reviews[0].notes[0])
+
 
 class UpdatesCliTests(unittest.TestCase):
     def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
@@ -905,6 +1008,30 @@ class UpdatesCliTests(unittest.TestCase):
         self.assertIn("baseline refresh --force", stdout)
         self.assertIn("No packages were updated.", stdout)
 
+    def test_baseline_refresh_uses_cached_latest_when_no_updates_are_pending(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            with (
+                patch("aur_diff_sentinel.cli.discover_updates", return_value=[]),
+                patch("aur_diff_sentinel.cli.AurCache", return_value=cache),
+                patch(
+                    "aur_diff_sentinel.update_review.installed_version",
+                    return_value="1.1-1",
+                ),
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "refresh", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("Review baselines refreshed from reviewed cache: 1", stdout)
+            self.assertEqual(cache.baseline_version("example-bin"), "1.1-1")
+
 
 def _fixture_fetcher(pkgver: str, pkgrel: str, extra_line: str):
     def fetcher(update: AurUpdate, target: Path) -> None:
@@ -923,6 +1050,27 @@ def _fixture_fetcher(pkgver: str, pkgrel: str, extra_line: str):
         )
 
     return fetcher
+
+
+def _write_metadata(root: Path, pkgname: str, pkgver: str, pkgrel: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "PKGBUILD").write_text(
+        "\n".join(
+            [
+                f"pkgname={pkgname}",
+                f"pkgver={pkgver}",
+                f"pkgrel={pkgrel}",
+                "sha256sums=('abc')",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    if root.parent.name == "baselines":
+        (root / ".aur-sentinel-baseline-version").write_text(
+            f"{pkgver}-{pkgrel}",
+            encoding="utf-8",
+        )
 
 
 def _copy_repo_fetcher(source: Path):

@@ -2,11 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.models import Finding
-from aur_diff_sentinel.provider import AurUpdate
+from aur_diff_sentinel.provider import AurUpdate, installed_version
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
+
+
+InstalledVersionGetter = Callable[[str], str | None]
 
 
 @dataclass
@@ -24,6 +28,7 @@ class UpdateReviewResult:
     reviews: list[PackageReview]
     refresh_requested: bool = False
     force_refresh: bool = False
+    cache_refresh: bool = False
 
     @property
     def findings(self) -> list[Finding]:
@@ -91,6 +96,56 @@ def review_updates(
         reviews=reviews,
         refresh_requested=refresh_baseline,
         force_refresh=force,
+    )
+
+
+def refresh_cached_reviewed_baselines(
+    cache: AurCache,
+    *,
+    installed_version_getter: InstalledVersionGetter | None = None,
+) -> UpdateReviewResult:
+    reviews: list[PackageReview] = []
+    installed_version_getter = installed_version_getter or installed_version
+
+    for package in cache.reviewed_cached_packages():
+        baseline_version = cache.baseline_version(package)
+        latest_version = cache.latest_version(package)
+        if baseline_version is None or latest_version is None:
+            continue
+
+        update = AurUpdate(package, baseline_version, latest_version)
+        review = PackageReview(
+            update=update,
+            baseline_available=True,
+        )
+
+        if baseline_version == latest_version:
+            review.notes.append("Review baseline already matches cached metadata.")
+            reviews.append(review)
+            continue
+
+        current_installed_version = installed_version_getter(package)
+        if current_installed_version != latest_version:
+            if current_installed_version is None:
+                review.notes.append("Installed package version could not be determined.")
+            else:
+                review.notes.append(
+                    f"Installed version is {current_installed_version}, "
+                    f"but cached metadata is {latest_version}."
+                )
+            review.notes.append("Review baseline was not refreshed.")
+            reviews.append(review)
+            continue
+
+        cache.refresh_baseline(update, cache.latest_dir(package))
+        review.baseline_refreshed = True
+        review.notes.append("Refreshed review baseline from cached metadata.")
+        reviews.append(review)
+
+    return UpdateReviewResult(
+        reviews=reviews,
+        refresh_requested=True,
+        cache_refresh=True,
     )
 
 

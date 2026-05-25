@@ -40,6 +40,17 @@ class AurCache:
     def latest_dir(self, package: str) -> Path:
         return self.root / "latest" / package
 
+    def reviewed_cached_packages(self) -> list[str]:
+        baseline_root = self.root / "baselines"
+        latest_root = self.root / "latest"
+        if not baseline_root.exists() or not latest_root.exists():
+            return []
+        return sorted(
+            path.name
+            for path in latest_root.iterdir()
+            if path.is_dir() and (baseline_root / path.name).is_dir()
+        )
+
     def fetch_latest(self, update: AurUpdate) -> Path:
         latest_dir = self.latest_dir(update.package)
         if latest_dir.exists():
@@ -50,6 +61,30 @@ class AurCache:
 
     def has_baseline(self, package: str) -> bool:
         return self.baseline_dir(package).exists()
+
+    def baseline_version(self, package: str) -> str | None:
+        version_file = self.baseline_dir(package) / BASELINE_VERSION_FILE
+        if not version_file.exists():
+            return None
+        try:
+            version = version_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        return version or None
+
+    def latest_version(self, package: str) -> str | None:
+        latest_dir = self.latest_dir(package)
+        for path_name in (".SRCINFO", "PKGBUILD"):
+            path = latest_dir / path_name
+            if not path.exists():
+                continue
+            try:
+                version = metadata_version(path.read_text(encoding="utf-8"))
+            except UnicodeDecodeError:
+                continue
+            if version:
+                return version
+        return None
 
     def initialize_baseline_from_installed_version(
         self,

@@ -47,6 +47,8 @@ findings. It does not install, build, or update packages.
 
 Use `baseline refresh` after you manually accept/update reviewed AUR metadata.
 If findings are present, refresh is blocked unless you use `--force`.
+After a successful manual update, `baseline refresh` can advance from the
+reviewed cached metadata even when no AUR updates are still pending.
 
 In `--diff` mode, the tool scans added lines from unified diffs and reports findings
 against the target file and line number when hunk metadata is available. It also
