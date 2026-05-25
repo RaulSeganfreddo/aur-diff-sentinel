@@ -730,6 +730,37 @@ class ProviderTests(unittest.TestCase):
             ],
         )
 
+    def test_parse_update_output_accepts_valid_package_name_characters(self) -> None:
+        updates = parse_update_output(
+            "\n".join(
+                [
+                    "browser-example-bin 1.0-1 -> 1.1-1",
+                    "lib32-example 1.0-1 -> 1.1-1",
+                    "pkg+feature 1.0-1 -> 1.1-1",
+                    "name@variant 1.0-1 -> 1.1-1",
+                    "name..variant 1.0-1 -> 1.1-1",
+                    "",
+                ]
+            )
+        )
+
+        self.assertEqual(
+            [update.package for update in updates],
+            [
+                "browser-example-bin",
+                "lib32-example",
+                "pkg+feature",
+                "name@variant",
+                "name..variant",
+            ],
+        )
+
+    def test_parse_update_output_rejects_invalid_package_names(self) -> None:
+        for package in ("../evil", "/tmp/pkg", ".hidden", "-bad", "bad/name"):
+            with self.subTest(package=package):
+                with self.assertRaisesRegex(RuntimeError, "invalid AUR package name"):
+                    parse_update_output(f"{package} 1.0-1 -> 1.1-1\n")
+
     def test_discover_updates_uses_injected_runner(self) -> None:
         def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
             self.assertEqual(command, ["paru", "-Qua"])
@@ -758,6 +789,65 @@ class UpdateWorkflowTests(unittest.TestCase):
     def test_metadata_version_reads_srcinfo_and_pkgbuild_shapes(self) -> None:
         self.assertEqual(metadata_version("pkgver = 1.0\npkgrel = 2\n"), "1.0-2")
         self.assertEqual(metadata_version("pkgver=1.0\npkgrel=2\n"), "1.0-2")
+
+    def test_fetch_latest_rejects_invalid_package_before_fetcher_runs(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            called = False
+
+            def fetcher(_update: AurUpdate, _target: Path) -> None:
+                nonlocal called
+                called = True
+
+            cache = AurCache(Path(temp_dir), fetcher=fetcher)
+
+            with self.assertRaisesRegex(RuntimeError, "invalid AUR package name"):
+                cache.fetch_latest(AurUpdate("../evil", "1.0-1", "1.1-1"))
+
+            self.assertFalse(called)
+            self.assertFalse((Path(temp_dir) / "latest").exists())
+
+    def test_refresh_baseline_rejects_invalid_package_before_replacing_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(root / "baselines" / "example-bin", "example-bin", "1.0", "1")
+            _write_metadata(root / "latest" / "example-bin", "example-bin", "1.1", "1")
+
+            with self.assertRaisesRegex(RuntimeError, "invalid AUR package name"):
+                cache.refresh_baseline(
+                    AurUpdate("../example-bin", "1.0-1", "1.1-1"),
+                    root / "latest" / "example-bin",
+                )
+
+            self.assertEqual(cache.baseline_version("example-bin"), "1.0-1")
+
+    def test_reviewed_cached_packages_ignores_invalid_cache_directory_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(root / "baselines" / "example-bin", "example-bin", "1.0", "1")
+            _write_metadata(root / "latest" / "example-bin", "example-bin", "1.1", "1")
+            _write_metadata(root / "baselines" / ".hidden", ".hidden", "1.0", "1")
+            _write_metadata(root / "latest" / ".hidden", ".hidden", "1.1", "1")
+
+            self.assertEqual(cache.reviewed_cached_packages(), ["example-bin"])
+
+    def test_cache_path_guard_refuses_symlink_escape_before_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "cache"
+            outside = Path(temp_dir) / "outside"
+            outside_package = outside / "example-bin"
+            outside_package.mkdir(parents=True)
+            (outside_package / "PKGBUILD").write_text("pkgname=example-bin\n", encoding="utf-8")
+            root.mkdir()
+            (root / "latest").symlink_to(outside, target_is_directory=True)
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('abc')"))
+
+            with self.assertRaisesRegex(RuntimeError, "outside cache directory"):
+                cache.fetch_latest(AurUpdate("example-bin", "1.0-1", "1.1-1"))
+
+            self.assertTrue(outside_package.exists())
+            self.assertTrue((outside_package / "PKGBUILD").exists())
 
     def test_updates_do_not_advance_existing_baseline(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

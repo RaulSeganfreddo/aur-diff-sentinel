@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Sequence
@@ -7,6 +8,7 @@ from dataclasses import dataclass
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
 
 
 @dataclass(frozen=True)
@@ -68,6 +70,15 @@ def installed_version(
     return None
 
 
+def validate_package_name(package: str) -> None:
+    if (
+        not package
+        or package[0] in ".-"
+        or not PACKAGE_NAME_RE.fullmatch(package)
+    ):
+        raise RuntimeError(f"invalid AUR package name: {package!r}")
+
+
 def parse_update_output(output: str) -> list[AurUpdate]:
     updates: list[AurUpdate] = []
 
@@ -79,6 +90,7 @@ def parse_update_output(output: str) -> list[AurUpdate]:
         if "->" in parts:
             arrow_index = parts.index("->")
             if arrow_index >= 2 and arrow_index + 1 < len(parts):
+                validate_package_name(parts[0])
                 updates.append(
                     AurUpdate(
                         package=parts[0],
@@ -89,6 +101,7 @@ def parse_update_output(output: str) -> list[AurUpdate]:
                 continue
 
         if len(parts) >= 3:
+            validate_package_name(parts[0])
             updates.append(
                 AurUpdate(
                     package=parts[0],

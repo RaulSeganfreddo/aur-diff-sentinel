@@ -7,7 +7,12 @@ import subprocess
 from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from aur_diff_sentinel.provider import AurUpdate, CommandRunner, default_runner
+from aur_diff_sentinel.provider import (
+    AurUpdate,
+    CommandRunner,
+    default_runner,
+    validate_package_name,
+)
 
 
 Fetcher = Callable[[AurUpdate, Path], None]
@@ -35,10 +40,10 @@ class AurCache:
         self.fetcher = fetcher or self._default_fetcher
 
     def baseline_dir(self, package: str) -> Path:
-        return self.root / "baselines" / package
+        return self._package_dir("baselines", package)
 
     def latest_dir(self, package: str) -> Path:
-        return self.root / "latest" / package
+        return self._package_dir("latest", package)
 
     def reviewed_cached_packages(self) -> list[str]:
         baseline_root = self.root / "baselines"
@@ -48,7 +53,9 @@ class AurCache:
         return sorted(
             path.name
             for path in latest_root.iterdir()
-            if path.is_dir() and (baseline_root / path.name).is_dir()
+            if path.is_dir()
+            and is_valid_package_name(path.name)
+            and (baseline_root / path.name).is_dir()
         )
 
     def fetch_latest(self, update: AurUpdate) -> Path:
@@ -128,6 +135,13 @@ class AurCache:
             error = result.stderr.strip() or result.stdout.strip() or "unknown git error"
             raise RuntimeError(f"failed to fetch {update.package}: {error}")
 
+    def _package_dir(self, namespace: str, package: str) -> Path:
+        validate_package_name(package)
+        root = self.root / namespace
+        path = root / package
+        _ensure_path_within(path, self.root)
+        return path
+
 
 def find_commit_for_version(
     repo_dir: Path,
@@ -164,12 +178,13 @@ def snapshot_commit(
 
     target.mkdir(parents=True, exist_ok=True)
     for relative_path in paths_result.stdout.splitlines():
-        if not relative_path or _is_ignored_path(Path(relative_path)):
+        if not _is_metadata_path_allowed(Path(relative_path)):
             continue
         file_result = runner(["git", "-C", str(repo_dir), "show", f"{commit}:{relative_path}"])
         if file_result.returncode != 0:
             continue
         destination = target / relative_path
+        _ensure_path_within(destination, target)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_text(file_result.stdout, encoding="utf-8")
 
@@ -199,6 +214,7 @@ def copy_metadata_tree(source: Path, target: Path) -> None:
     for path in _metadata_paths(source):
         relative_path = path.relative_to(source)
         destination = target / relative_path
+        _ensure_path_within(destination, target)
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(path, destination)
 
@@ -234,7 +250,9 @@ def _metadata_paths(root: Path) -> list[Path]:
     return [
         path
         for path in root.rglob("*")
-        if path.is_file() and not _is_ignored_path(path.relative_to(root))
+        if path.is_file()
+        and not path.is_symlink()
+        and _is_metadata_path_allowed(path.relative_to(root))
     ]
 
 
@@ -254,3 +272,28 @@ def _read_text_or_empty(path: Path) -> str:
 def _is_ignored_path(path: Path) -> bool:
     parts = path.parts
     return ".git" in parts or path.name == BASELINE_VERSION_FILE
+
+
+def is_valid_package_name(package: str) -> bool:
+    try:
+        validate_package_name(package)
+    except RuntimeError:
+        return False
+    return True
+
+
+def _is_metadata_path_allowed(path: Path) -> bool:
+    return (
+        bool(path.parts)
+        and not path.is_absolute()
+        and ".." not in path.parts
+        and "\\" not in path.as_posix()
+        and not _is_ignored_path(path)
+    )
+
+
+def _ensure_path_within(path: Path, root: Path) -> None:
+    resolved_path = path.resolve()
+    resolved_root = root.resolve()
+    if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
+        raise RuntimeError(f"refusing to write outside cache directory: {path}")
