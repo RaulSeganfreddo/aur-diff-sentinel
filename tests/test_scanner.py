@@ -597,6 +597,43 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("Review baselines were refreshed from cached metadata.", report)
         self.assertIn("No packages were updated.", report)
 
+    def test_cached_refresh_report_hides_already_matching_packages_by_default(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("refreshed-pkg", "1.0-1", "1.1-1"),
+                    notes=["Refreshed review baseline for installed version 1.1-1."],
+                    baseline_refreshed=True,
+                ),
+                PackageReview(
+                    update=AurUpdate("already-current-pkg", "2.0-1", "2.0-1"),
+                    notes=["Review baseline already matches reviewed metadata."],
+                ),
+            ],
+            refresh_requested=True,
+            cache_refresh=True,
+        )
+        report = format_update_review(result)
+
+        self.assertIn("refreshed-pkg: 1.0-1 -> 1.1-1", report)
+        self.assertNotIn("already-current-pkg", report)
+
+    def test_verbose_cached_refresh_report_shows_already_matching_packages(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("already-current-pkg", "2.0-1", "2.0-1"),
+                    notes=["Review baseline already matches reviewed metadata."],
+                )
+            ],
+            refresh_requested=True,
+            cache_refresh=True,
+        )
+        report = format_update_review(result, verbose=True)
+
+        self.assertIn("already-current-pkg: 2.0-1 -> 2.0-1", report)
+        self.assertIn("Review baseline already matches reviewed metadata.", report)
+
     def test_cached_refresh_report_explains_no_refresh_candidates(self) -> None:
         result = UpdateReviewResult(
             reviews=[],

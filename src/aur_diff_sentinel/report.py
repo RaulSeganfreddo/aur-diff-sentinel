@@ -84,7 +84,7 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -
         lines.extend(_format_attention_summary(result.reviews))
 
     for review in result.reviews:
-        if not review.findings and not review.notes:
+        if not _should_show_review(result, review, verbose=verbose):
             continue
 
         lines.append(
@@ -137,6 +137,28 @@ def _format_cache_refresh_header(result: UpdateReviewResult) -> list[str]:
         ]
     )
     return lines
+
+
+def _should_show_review(
+    result: UpdateReviewResult,
+    review: PackageReview,
+    *,
+    verbose: bool,
+) -> bool:
+    if not review.findings and not review.notes:
+        return False
+    if verbose or not result.cache_refresh:
+        return True
+    return not _is_already_matching_refresh_review(review)
+
+
+def _is_already_matching_refresh_review(review: PackageReview) -> bool:
+    return (
+        not review.findings
+        and not review.baseline_refreshed
+        and not review.refresh_blocked
+        and review.notes == ["Review baseline already matches reviewed metadata."]
+    )
 
 
 def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:
