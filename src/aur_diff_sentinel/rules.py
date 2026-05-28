@@ -80,6 +80,23 @@ def _writes_outside_pkgdir(line: SourceLine) -> bool:
     return any(_is_sensitive_path(token) for token in operands)
 
 
+def _source_command(line: SourceLine) -> bool:
+    content = line.content.lstrip()
+    if content.startswith("source"):
+        rest = content[len("source"):]
+        if not rest or not rest[0].isspace():
+            return False
+    elif content.startswith("."):
+        rest = content[1:]
+        if not rest or not rest[0].isspace():
+            return False
+    else:
+        return False
+
+    argument = rest.lstrip()
+    return bool(argument) and not argument.startswith("#") and not argument.startswith("=")
+
+
 RULES: list[Rule] = [
     Rule.regex(
         id="eval-used",
@@ -130,10 +147,10 @@ RULES: list[Rule] = [
         message="Dynamic shell execution detected",
         hint="sh -c and bash -c can hide complex generated command execution.",
     ),
-    Rule.regex(
+    Rule.contextual(
         id="source-command",
         severity=Severity.MEDIUM,
-        pattern=r"^\s*(source|\.)\s+[^\s#]+",
+        matcher=_source_command,
         message="Shell source command detected",
         hint="Sourcing a file executes it in the current shell context.",
     ),

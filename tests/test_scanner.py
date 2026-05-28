@@ -57,7 +57,23 @@ class ScannerTests(unittest.TestCase):
 
     def test_source_command_is_detected(self) -> None:
         self.assertIn("source-command", rule_ids("source ./extra.sh"))
+        self.assertIn("source-command", rule_ids('source "$srcdir/extra.sh"'))
         self.assertIn("source-command", rule_ids(". ./extra.sh"))
+
+    def test_source_metadata_is_not_treated_as_shell_source_command(self) -> None:
+        self.assertNotIn(
+            "source-command",
+            {
+                finding.rule_id
+                for finding in scan_text(
+                    "source = file::https://example.invalid/file",
+                    filename=".SRCINFO",
+                )
+            },
+        )
+        self.assertNotIn("source-command", rule_ids('source=("https://example.invalid/file")'))
+        self.assertNotIn("source-command", rule_ids('source_x86_64=("https://example.invalid/file")'))
+        self.assertNotIn("source-command", rule_ids('_source="https://example.invalid/file"'))
 
     def test_obfuscated_command_is_detected(self) -> None:
         self.assertIn("obfuscated-command", rule_ids("base64 -d payload.txt | sh"))
