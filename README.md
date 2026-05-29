@@ -90,7 +90,8 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - `.install` script references
 - `sh -c` / `bash -c`
 - shell `source` commands
-- obvious obfuscated command execution
+- decoded content piped into shells
+- compact inline interpreter commands
 - network activity inside build functions
 - obvious writes outside `$pkgdir`
 - newly added source URLs in diffs
@@ -100,7 +101,7 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - removed checksum arrays in diffs
 - checksum algorithm weakening in diffs
 - source/checksum count mismatches in diffs
-- VCS checksum `SKIP` cases at lower severity in diffs
+- VCS checksum `SKIP` cases at lower severity when source context is available
 - pending AUR updates discovered through `paru` or `yay`
 - cached reviewed packages that are no longer installed
 
