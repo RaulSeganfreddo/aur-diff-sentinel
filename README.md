@@ -26,19 +26,21 @@ pip install -e .
 
 ## Usage
 
+Basic scans:
+
 ```bash
 aur-diff-sentinel PKGBUILD
 aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
 aur-diff-sentinel --diff --verbose update.diff
-aur-diff-sentinel updates
-aur-diff-sentinel baseline refresh
 ```
 
-Typical workflow:
+AUR update workflow:
 
 ```bash
 aur-diff-sentinel updates
+paru -Syu
+aur-diff-sentinel baseline refresh
 ```
 
 The `updates` command asks `paru` or `yay` which AUR packages have updates,
@@ -51,6 +53,21 @@ After a successful manual update, `baseline refresh` can advance from the
 reviewed cached metadata even when no AUR updates are still pending.
 Baselines are only advanced when the installed package version matches the
 reviewed metadata version.
+
+If you update only some pending packages, `baseline refresh` refreshes only the
+baselines whose reviewed metadata matches the installed package version. Packages
+left pending are reported but not refreshed.
+
+Baseline maintenance:
+
+```bash
+aur-diff-sentinel baseline prune
+aur-diff-sentinel baseline prune --all
+```
+
+If a reviewed package is no longer installed, use `baseline prune` to remove only
+aur-diff-sentinel's cached metadata for that package. The prune command never
+removes system packages.
 
 In `--diff` mode, the tool scans added lines from unified diffs and reports findings
 against the target file and line number when hunk metadata is available. It also
@@ -80,6 +97,7 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - source/checksum count mismatches in diffs
 - VCS checksum `SKIP` cases at lower severity in diffs
 - pending AUR updates discovered through `paru` or `yay`
+- cached reviewed packages that are no longer installed
 
 ## Output
 
@@ -125,4 +143,5 @@ Important limits:
 - it relies on `paru` or `yay` only for update discovery
 - it does not inspect downloaded source archives
 - it does not install, build, or update packages
+- `baseline prune` removes only this tool's cached metadata
 - it does not prove that a package is safe
