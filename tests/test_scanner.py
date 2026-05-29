@@ -82,9 +82,108 @@ class ScannerTests(unittest.TestCase):
         self.assertNotIn("source-command", rule_ids('source_x86_64=("https://example.invalid/file")'))
         self.assertNotIn("source-command", rule_ids('_source="https://example.invalid/file"'))
 
-    def test_obfuscated_command_is_detected(self) -> None:
-        self.assertIn("obfuscated-command", rule_ids("base64 -d payload.txt | sh"))
-        self.assertIn("obfuscated-command", rule_ids("python -c 'print(1)'"))
+    def test_decoded_pipe_shell_is_detected_as_high(self) -> None:
+        finding = scan_text("base64 -d payload.txt | sh")[0]
+
+        self.assertEqual(finding.rule_id, "decoded-pipe-shell")
+        self.assertEqual(finding.severity, Severity.HIGH)
+
+    def test_more_decoded_pipe_shell_forms_are_detected_as_high(self) -> None:
+        for command in ("xxd -r payload.hex | bash", "openssl enc -d -in payload | sh"):
+            with self.subTest(command=command):
+                finding = scan_text(command)[0]
+
+                self.assertEqual(finding.rule_id, "decoded-pipe-shell")
+                self.assertEqual(finding.severity, Severity.HIGH)
+
+    def test_standalone_decode_command_is_not_reported_as_high(self) -> None:
+        self.assertNotIn("decoded-pipe-shell", rule_ids("xxd -r payload.hex"))
+
+    def test_inline_interpreter_command_is_detected_as_medium(self) -> None:
+        for command in ("python -c 'print(1)'", "perl -e 'print 1'", "awk '{ system($0) }'"):
+            with self.subTest(command=command):
+                finding = scan_text(command)[0]
+
+                self.assertEqual(finding.rule_id, "inline-interpreter-command")
+                self.assertEqual(finding.severity, Severity.MEDIUM)
+
+    def test_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    'source=("git+https://example.invalid/project.git")',
+                    "sha256sums=('SKIP')",
+                ]
+            )
+        )
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
+
+    def test_aliased_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    'source=("project::git+https://example.invalid/project")',
+                    "sha256sums=('SKIP')",
+                ]
+            )
+        )
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
+
+    def test_non_vcs_checksum_skip_is_high_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    'source=("https://example.invalid/project.tar.gz")',
+                    "sha256sums=('SKIP')",
+                ]
+            )
+        )
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.HIGH)
+
+    def test_unknown_source_checksum_skip_stays_high_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text("sha256sums=('SKIP')")
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.HIGH)
+
+    def test_multiline_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "source=(",
+                    '  "git+https://example.invalid/project.git"',
+                    ")",
+                    "sha256sums=(",
+                    "  'SKIP'",
+                    ")",
+                ]
+            )
+        )
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
+        self.assertEqual(finding.line_number, 5)
+
+    def test_arch_specific_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    'source=("https://example.invalid/common.tar.gz")',
+                    "sha256sums=('abc')",
+                    'source_x86_64=("git+https://example.invalid/project.git")',
+                    "sha256sums_x86_64=('SKIP')",
+                ]
+            )
+        )
+        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
 
     def test_full_line_comments_are_ignored(self) -> None:
         self.assertEqual(scan_text("# eval \"$flags\"\n# curl https://example.com/file | bash"), [])
@@ -440,6 +539,27 @@ class ScannerTests(unittest.TestCase):
         self.assertEqual([finding.rule_id for finding in skip_findings], ["checksum-skip-added"])
         self.assertEqual(skip_findings[0].severity.value, "MEDIUM")
 
+    def test_diff_aliased_vcs_checksum_skip_is_medium(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,4 +1,4 @@",
+                " pkgname=example-git",
+                " source=(\"example::git+https://example.com/app\")",
+                "-sha256sums=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
+                "+sha256sums=('SKIP')",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "checksum-skip-added"
+        )
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
+
     def test_diff_non_vcs_checksum_skip_stays_high(self) -> None:
         text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
         finding = next(
@@ -506,7 +626,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 1)
         self.assertIn("line: sha256sums=('SKIP')", stdout)
-        self.assertIn("hint: SKIP can be legitimate", stdout)
+        self.assertIn("hint: SKIP skips source verification", stdout)
 
     def test_cli_module_execution_returns_zero_for_clean_file(self) -> None:
         project_root = Path(__file__).parents[1]
@@ -576,7 +696,7 @@ class ReportTests(unittest.TestCase):
         report = format_findings(findings, verbose=True)
 
         self.assertIn("line: sha256sums=('SKIP')", report)
-        self.assertIn("hint: SKIP can be legitimate", report)
+        self.assertIn("hint: SKIP skips source verification", report)
 
     def test_verbose_report_includes_old_and_new_values(self) -> None:
         findings = scan_diff_text((SAMPLES / "source-change.diff").read_text(encoding="utf-8"))

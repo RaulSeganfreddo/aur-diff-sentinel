@@ -10,6 +10,7 @@ Key files:
 - `cli.py`: command-line interface
 - `scanner.py`: scanning logic
 - `rules.py`: detection rules
+- `pkgbuild_analysis.py`: PKGBUILD-aware analysis that needs file-level context
 - `diff_analysis.py`: PKGBUILD diff analysis
 - `report.py`: output formatting
 - `provider.py`: AUR helper integration

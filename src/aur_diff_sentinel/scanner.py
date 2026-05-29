@@ -5,6 +5,7 @@ from collections.abc import Iterable, Sequence
 
 from aur_diff_sentinel.diff_analysis import analyze_source_diff
 from aur_diff_sentinel.models import Finding, Rule, SourceLine
+from aur_diff_sentinel.pkgbuild_analysis import analyze_pkgbuild_checksums
 from aur_diff_sentinel.rules import RULES
 
 
@@ -172,7 +173,18 @@ def scan_text(
     rules: Sequence[Rule] = RULES,
     filename: str | None = None,
 ) -> list[Finding]:
-    return scan_lines(source_lines_from_text(text, filename=filename), rules=rules)
+    findings = scan_lines(source_lines_from_text(text, filename=filename), rules=rules)
+    if rules is RULES:
+        findings.extend(analyze_pkgbuild_checksums(text, filename=filename))
+    return _sort_findings_by_source_order(findings)
+
+
+def _sort_findings_by_source_order(findings: list[Finding]) -> list[Finding]:
+    ordered = sorted(
+        enumerate(findings),
+        key=lambda item: (item[1].line_number, item[0]),
+    )
+    return [finding for _index, finding in ordered]
 
 
 def scan_diff_text(

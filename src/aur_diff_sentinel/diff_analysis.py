@@ -633,8 +633,14 @@ def _array_suffix(name: str) -> str:
 def _is_vcs_source(source: str | None) -> bool:
     if source is None:
         return False
-    lowered = source.lower()
+    lowered = _source_without_alias(source).lower()
     return lowered.startswith(VCS_PREFIXES) or urlparse(lowered).path.endswith(".git")
+
+
+def _source_without_alias(source: str) -> str:
+    if "::" not in source:
+        return source
+    return source.split("::", 1)[1]
 
 
 def _checksum_skip_hint(severity: Severity) -> str:

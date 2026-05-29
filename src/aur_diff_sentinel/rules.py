@@ -113,13 +113,6 @@ RULES: list[Rule] = [
         hint="Executing downloaded content directly bypasses normal source review.",
     ),
     Rule.regex(
-        id="checksum-skip",
-        severity=Severity.HIGH,
-        pattern=r"\b(md5|sha1|sha224|sha256|sha384|sha512|b2)sums(_[a-z0-9_]+)?\b.*(['\"]?)SKIP\3",
-        message="Checksum verification skipped",
-        hint="SKIP can be legitimate for VCS sources, but should be reviewed.",
-    ),
-    Rule.regex(
         id="setuid-permission",
         severity=Severity.HIGH,
         pattern=r"\b(chmod\s+(?:[0-7]*[46][0-7]{3}|[ug]\+s)|install\s+-[A-Za-z]*m\s*?[46][0-7]{3}|install\s+-[A-Za-z]*m[46][0-7]{3})\b",
@@ -155,11 +148,18 @@ RULES: list[Rule] = [
         hint="Sourcing a file executes it in the current shell context.",
     ),
     Rule.regex(
-        id="obfuscated-command",
+        id="decoded-pipe-shell",
         severity=Severity.HIGH,
-        pattern=r"(\bbase64\s+(-d|--decode)\b[^|;]*\|\s*(/usr/bin/)?(ba)?sh\b|\bxxd\s+-r\b|\bopenssl\s+enc\s+-d\b|\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b|\bawk\b.*\bsystem\s*\()",
-        message="Obfuscated or compact dynamic execution detected",
-        hint="Obfuscation or one-liner interpreters can hide behavior from review.",
+        pattern=r"\b(base64\s+(-d|--decode)|xxd\s+-r|openssl\s+enc\s+-d)\b[^|;]*\|\s*(/usr/bin/)?(ba)?sh\b",
+        message="Decoded content piped into a shell",
+        hint="Decoding content and executing it through a shell can hide behavior from review.",
+    ),
+    Rule.regex(
+        id="inline-interpreter-command",
+        severity=Severity.MEDIUM,
+        pattern=r"(\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b|\bawk\b.*\bsystem\s*\()",
+        message="Inline interpreter command detected",
+        hint="Inline interpreter commands can hide meaningful behavior in compact code.",
     ),
     Rule.contextual(
         id="network-in-build",

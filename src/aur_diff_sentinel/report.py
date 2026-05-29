@@ -22,7 +22,8 @@ REASON_PHRASES = {
     "privilege-command": "live-system command",
     "shell-c": "dynamic shell execution",
     "source-command": "shell source command",
-    "obfuscated-command": "obfuscated or compact execution",
+    "decoded-pipe-shell": "decoded content piped into shell",
+    "inline-interpreter-command": "inline interpreter command",
     "network-in-build": "network activity during build",
     "writes-outside-pkgdir": "write outside pkgdir",
 }
