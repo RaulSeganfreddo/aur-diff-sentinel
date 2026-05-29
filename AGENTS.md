@@ -15,6 +15,7 @@ Key files:
 - `provider.py`: AUR helper integration
 - `cache.py`: baseline/cache handling
 - `update_review.py`: pending update review and baseline refresh workflow
+- `baseline_status.py`: read-only baseline status reporting
 - `baseline_prune.py`: pruning cached metadata for packages no longer installed
 Tests live in `tests/`; fixtures live in `tests/samples/`.
 
