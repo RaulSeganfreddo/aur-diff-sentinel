@@ -11,10 +11,17 @@ from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
 from aur_diff_sentinel.cache import AurCache, metadata_version
 from aur_diff_sentinel.cli import run
 from aur_diff_sentinel.models import Finding, Severity
-from aur_diff_sentinel.provider import AurUpdate, discover_updates, parse_update_output
+from aur_diff_sentinel.provider import (
+    AurUpdate,
+    InstalledPackageStatus,
+    discover_updates,
+    parse_update_output,
+    query_installed_package,
+)
 from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
 from aur_diff_sentinel.update_review import (
@@ -837,6 +844,56 @@ class ProviderTests(unittest.TestCase):
 
         self.assertEqual(discover_updates("paru", runner=runner), [])
 
+    def test_query_installed_package_distinguishes_missing_and_unknown_errors(self) -> None:
+        def missing_runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "error: package 'example-bin' was not found")
+
+        missing = query_installed_package("example-bin", runner=missing_runner)
+        self.assertTrue(missing.missing)
+        self.assertIsNone(missing.version)
+
+        def unknown_runner(_command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 1, "", "pacman database error")
+
+        unknown = query_installed_package("example-bin", runner=unknown_runner)
+        self.assertFalse(unknown.missing)
+        self.assertEqual(unknown.error, "pacman database error")
+
+
+class BaselinePruneTests(unittest.TestCase):
+    def test_parse_prune_selection_accepts_numbers_ranges_all_and_none(self) -> None:
+        self.assertEqual(parse_prune_selection("1", 3), [0])
+        self.assertEqual(parse_prune_selection("1,3", 3), [0, 2])
+        self.assertEqual(parse_prune_selection("1-3", 3), [0, 1, 2])
+        self.assertEqual(parse_prune_selection("1,2-3", 3), [0, 1, 2])
+        self.assertEqual(parse_prune_selection("all", 3), [0, 1, 2])
+        self.assertEqual(parse_prune_selection("none", 3), [])
+        self.assertEqual(parse_prune_selection("", 3), [])
+
+    def test_parse_prune_selection_rejects_invalid_values(self) -> None:
+        for value in ("0", "4", "2-1", "abc", "1,,2"):
+            with self.subTest(value=value):
+                with self.assertRaises(SelectionError):
+                    parse_prune_selection(value, 3)
+
+    def test_prune_package_removes_latest_and_baseline_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+            _write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
+            _write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
+
+            cache.prune_package("example-bin")
+
+            self.assertFalse(cache.baseline_dir("example-bin").exists())
+            self.assertFalse(cache.latest_dir("example-bin").exists())
+
+    def test_prune_package_rejects_invalid_package_names(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache = AurCache(Path(temp_dir))
+
+            with self.assertRaisesRegex(RuntimeError, "invalid AUR package name"):
+                cache.prune_package("../example-bin")
+
 
 class UpdateWorkflowTests(unittest.TestCase):
     def test_metadata_version_reads_srcinfo_and_pkgbuild_shapes(self) -> None:
@@ -1204,11 +1261,11 @@ class UpdateWorkflowTests(unittest.TestCase):
 
 
 class UpdatesCliTests(unittest.TestCase):
-    def run_cli(self, argv: list[str]) -> tuple[int, str, str]:
+    def run_cli(self, argv: list[str], stdin_text: str = "") -> tuple[int, str, str]:
         stdout = io.StringIO()
         stderr = io.StringIO()
         with redirect_stdout(stdout), redirect_stderr(stderr):
-            exit_code = run(argv)
+            exit_code = run(argv, stdin=io.StringIO(stdin_text))
         return exit_code, stdout.getvalue(), stderr.getvalue()
 
     def test_updates_no_updates_returns_zero(self) -> None:
@@ -1259,6 +1316,7 @@ class UpdatesCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("updates", stdout)
         self.assertIn("baseline refresh", stdout)
+        self.assertIn("baseline prune", stdout)
 
     def test_updates_helper_error_returns_two(self) -> None:
         with patch("aur_diff_sentinel.cli.discover_updates", side_effect=RuntimeError("no helper")):
@@ -1320,6 +1378,133 @@ class UpdatesCliTests(unittest.TestCase):
             self.assertEqual(stderr, "")
             self.assertIn("Review baselines refreshed: 1", stdout)
             self.assertEqual(cache.baseline_version("example-bin"), "1.1-1")
+
+    def test_baseline_prune_reports_no_missing_cached_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(cache.baseline_dir("installed-pkg"), "installed-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("installed-pkg"), "installed-pkg", "1.0", "1")
+
+            with patch(
+                "aur_diff_sentinel.baseline_prune.query_installed_package",
+                return_value=InstalledPackageStatus("installed-pkg", version="1.0-1"),
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "prune", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("No cached reviewed packages are missing from the system.", stdout)
+            self.assertIn("No packages were updated.", stdout)
+
+    def test_baseline_prune_interactively_prunes_selected_package(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            for package in ("missing-a", "missing-b", "installed-pkg"):
+                _write_metadata(cache.baseline_dir(package), package, "1.0", "1")
+                _write_metadata(cache.latest_dir(package), package, "1.0", "1")
+
+            def status(package: str) -> InstalledPackageStatus:
+                if package == "installed-pkg":
+                    return InstalledPackageStatus(package, version="1.0-1")
+                return InstalledPackageStatus(package, missing=True, error="package was not found")
+
+            with patch("aur_diff_sentinel.baseline_prune.query_installed_package", side_effect=status):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "prune", "--cache-dir", str(root)],
+                    stdin_text="1\ny\n",
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("Cached reviewed packages no longer installed:", stdout)
+            self.assertIn("Pruned sentinel cache for packages no longer installed: 1", stdout)
+            self.assertFalse(cache.baseline_dir("missing-a").exists())
+            self.assertFalse(cache.latest_dir("missing-a").exists())
+            self.assertTrue(cache.baseline_dir("missing-b").exists())
+            self.assertTrue(cache.latest_dir("missing-b").exists())
+            self.assertTrue(cache.baseline_dir("installed-pkg").exists())
+
+    def test_baseline_prune_confirmation_no_prunes_nothing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(cache.baseline_dir("missing-pkg"), "missing-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("missing-pkg"), "missing-pkg", "1.0", "1")
+
+            with patch(
+                "aur_diff_sentinel.baseline_prune.query_installed_package",
+                return_value=InstalledPackageStatus(
+                    "missing-pkg",
+                    missing=True,
+                    error="package was not found",
+                ),
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "prune", "--cache-dir", str(root)],
+                    stdin_text="all\nn\n",
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("No sentinel cache entries were pruned.", stdout)
+            self.assertTrue(cache.baseline_dir("missing-pkg").exists())
+            self.assertTrue(cache.latest_dir("missing-pkg").exists())
+
+    def test_baseline_prune_all_prunes_all_missing_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            for package in ("missing-a", "missing-b", "installed-pkg"):
+                _write_metadata(cache.baseline_dir(package), package, "1.0", "1")
+                _write_metadata(cache.latest_dir(package), package, "1.0", "1")
+
+            def status(package: str) -> InstalledPackageStatus:
+                if package == "installed-pkg":
+                    return InstalledPackageStatus(package, version="1.0-1")
+                return InstalledPackageStatus(package, missing=True, error="package was not found")
+
+            with patch("aur_diff_sentinel.baseline_prune.query_installed_package", side_effect=status):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "prune", "--all", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("Pruned sentinel cache for packages no longer installed: 2", stdout)
+            self.assertFalse(cache.baseline_dir("missing-a").exists())
+            self.assertFalse(cache.latest_dir("missing-a").exists())
+            self.assertFalse(cache.baseline_dir("missing-b").exists())
+            self.assertFalse(cache.latest_dir("missing-b").exists())
+            self.assertTrue(cache.baseline_dir("installed-pkg").exists())
+
+    def test_baseline_prune_reports_unknown_status_without_pruning(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(cache.baseline_dir("unknown-pkg"), "unknown-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("unknown-pkg"), "unknown-pkg", "1.0", "1")
+
+            with patch(
+                "aur_diff_sentinel.baseline_prune.query_installed_package",
+                return_value=InstalledPackageStatus(
+                    "unknown-pkg",
+                    error="pacman database error",
+                ),
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "prune", "--all", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("could not be checked", stdout)
+            self.assertIn("unknown-pkg: pacman database error", stdout)
+            self.assertTrue(cache.baseline_dir("unknown-pkg").exists())
+            self.assertTrue(cache.latest_dir("unknown-pkg").exists())
 
 
 def _fixture_fetcher(pkgver: str, pkgrel: str, extra_line: str):

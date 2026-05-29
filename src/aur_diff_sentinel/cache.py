@@ -118,6 +118,11 @@ class AurCache:
         copy_metadata_tree(latest_dir, baseline_dir)
         (baseline_dir / BASELINE_VERSION_FILE).write_text(update.new_version, encoding="utf-8")
 
+    def prune_package(self, package: str) -> None:
+        for path in (self.baseline_dir(package), self.latest_dir(package)):
+            if path.exists():
+                shutil.rmtree(path)
+
     def diff_baseline_to_latest(self, package: str, latest_dir: Path) -> str:
         return unified_diff_dirs(self.baseline_dir(package), latest_dir)
 

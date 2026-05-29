@@ -18,6 +18,14 @@ class AurUpdate:
     new_version: str
 
 
+@dataclass(frozen=True)
+class InstalledPackageStatus:
+    package: str
+    version: str | None = None
+    missing: bool = False
+    error: str | None = None
+
+
 def default_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(command),
@@ -60,14 +68,40 @@ def installed_version(
     *,
     runner: CommandRunner = default_runner,
 ) -> str | None:
-    result = runner(["pacman", "-Q", package])
+    status = query_installed_package(package, runner=runner)
+    return status.version
+
+
+def query_installed_package(
+    package: str,
+    *,
+    runner: CommandRunner = default_runner,
+) -> InstalledPackageStatus:
+    validate_package_name(package)
+    try:
+        result = runner(["pacman", "-Q", package])
+    except OSError as exc:
+        return InstalledPackageStatus(package=package, error=str(exc))
     if result.returncode != 0:
-        return None
+        error = result.stderr.strip() or result.stdout.strip() or "unknown pacman error"
+        return InstalledPackageStatus(
+            package=package,
+            missing=_is_not_installed_error(error),
+            error=error,
+        )
 
     parts = result.stdout.split()
     if len(parts) >= 2 and parts[0] == package:
-        return parts[1]
-    return None
+        return InstalledPackageStatus(package=package, version=parts[1])
+    return InstalledPackageStatus(
+        package=package,
+        error="pacman returned unexpected package query output",
+    )
+
+
+def _is_not_installed_error(error: str) -> bool:
+    lowered = error.lower()
+    return "was not found" in lowered or "not found" in lowered
 
 
 def validate_package_name(package: str) -> None:
