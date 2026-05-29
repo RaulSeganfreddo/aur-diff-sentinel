@@ -14,6 +14,8 @@ Key files:
 - `report.py`: output formatting
 - `provider.py`: AUR helper integration
 - `cache.py`: baseline/cache handling
+- `update_review.py`: pending update review and baseline refresh workflow
+- `baseline_prune.py`: pruning cached metadata for packages no longer installed
 Tests live in `tests/`; fixtures live in `tests/samples/`.
 
 ## Commands
@@ -23,6 +25,9 @@ Run from the repository root:
     pytest
     aur-diff-sentinel tests/samples/clean.PKGBUILD
     aur-diff-sentinel --diff tests/samples/suspicious.diff
+    aur-diff-sentinel updates
+    aur-diff-sentinel baseline refresh
+    aur-diff-sentinel baseline prune
 
 ## Coding Rules
 Follow existing style.
@@ -40,6 +45,9 @@ Normal scans must never install, build, update, or execute AUR packages.
 Never run code from inspected PKGBUILDs.
 Do not claim that “no findings” means safe.
 Keep cache paths configurable with `--cache-dir`.
+The `updates` command may query `paru` or `yay` for pending updates and fetch AUR metadata, but it must not update packages.
+The `baseline refresh` command may query installed versions with `pacman -Q`, but it must only refresh sentinel baselines when reviewed metadata matches the installed package version.
+The `baseline prune` command must remove only aur-diff-sentinel cache entries for packages no longer installed; it must never remove system packages.
 
 ## Tests
 Tests use `unittest.TestCase` and run with `pytest`.
@@ -49,4 +57,4 @@ When `.venv/` exists, prefer running tests through the project virtualenv:
 
 If plain `pytest` or `python -m pytest` is unavailable, try the venv before assuming test dependencies are missing.
 Add tests for both detections and false-positive guards.
-Do not use real network, real AUR helpers, or real `git clone` in tests. Mock or inject those dependencies.
+Do not use real network, real AUR helpers, real `pacman`, or real `git clone` in tests. Mock or inject those dependencies.
