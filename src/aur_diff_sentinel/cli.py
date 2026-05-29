@@ -12,6 +12,7 @@ from aur_diff_sentinel.baseline_prune import (
     prune_cached_packages,
     scan_prune_candidates,
 )
+from aur_diff_sentinel.baseline_status import format_baseline_status, scan_baseline_status
 from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.provider import InstalledPackageStatus, discover_updates
 from aur_diff_sentinel.report import format_findings, format_update_review
@@ -22,6 +23,7 @@ from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_u
 MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] PATH
        aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose]
        aur-diff-sentinel baseline refresh [--helper {paru,yay}] [--cache-dir PATH] [--force] [--verbose]
+       aur-diff-sentinel baseline status [--cache-dir PATH]
        aur-diff-sentinel baseline prune [--cache-dir PATH] [--all]
 
 Highlight suspicious patterns in AUR PKGBUILDs, diffs, and pending AUR updates.
@@ -29,6 +31,7 @@ Highlight suspicious patterns in AUR PKGBUILDs, diffs, and pending AUR updates.
 commands:
   updates           review pending AUR updates without installing them
   baseline refresh  refresh review baselines after accepting reviewed metadata
+  baseline status   show reviewed baseline status without changing cache
   baseline prune    remove sentinel cache for packages no longer installed
 
 scan options:
@@ -113,6 +116,15 @@ def build_baseline_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="show matched source lines and rule hints",
+    )
+    status = subparsers.add_parser(
+        "status",
+        help="show reviewed baseline status without changing cache",
+    )
+    status.add_argument(
+        "--cache-dir",
+        type=Path,
+        help="override the aur-diff-sentinel cache directory",
     )
     prune = subparsers.add_parser(
         "prune",
@@ -222,6 +234,8 @@ def _run_baseline(
     parser = build_baseline_parser()
     args = parser.parse_args(argv)
 
+    if args.baseline_command == "status":
+        return _run_baseline_status(args, stdout=stdout)
     if args.baseline_command == "prune":
         return _run_baseline_prune(args, stdout=stdout, stderr=stderr, stdin=stdin)
 
@@ -241,6 +255,16 @@ def _run_baseline(
     if result.refresh_blocked:
         return 2
     return 1 if result.has_findings else 0
+
+
+def _run_baseline_status(
+    args: argparse.Namespace,
+    *,
+    stdout: TextIO,
+) -> int:
+    cache = AurCache(args.cache_dir)
+    print(format_baseline_status(scan_baseline_status(cache)), file=stdout)
+    return 0
 
 
 def _run_baseline_prune(

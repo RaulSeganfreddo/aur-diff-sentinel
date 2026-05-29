@@ -83,10 +83,12 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -
         lines = [f"AUR updates found: {len(result.reviews)}", ""]
         lines.extend(_format_attention_summary(result.reviews))
 
-    for review in result.reviews:
-        if not _should_show_review(result, review, verbose=verbose):
-            continue
-
+    visible_reviews = [
+        review
+        for review in result.reviews
+        if _should_show_review(result, review, verbose=verbose)
+    ]
+    for review in visible_reviews:
         lines.append(
             f"{review.update.package}: {review.update.old_version} -> {review.update.new_version}"
         )
@@ -110,7 +112,10 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -
     elif result.refresh_requested and result.cache_refresh:
         refreshed_count = sum(1 for review in result.reviews if review.baseline_refreshed)
         if not refreshed_count:
-            lines.append("Review baselines were not refreshed.")
+            if visible_reviews:
+                lines.append("Review baselines were not refreshed.")
+            else:
+                lines.append("No baseline refreshes needed.")
     elif result.refresh_requested:
         lines.append("Review baselines were refreshed.")
     else:

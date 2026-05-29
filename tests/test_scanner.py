@@ -641,6 +641,22 @@ class ReportTests(unittest.TestCase):
         self.assertIn("already-current-pkg: 2.0-1 -> 2.0-1", report)
         self.assertIn("Review baseline already matches reviewed metadata.", report)
 
+    def test_cached_refresh_report_explains_noop_when_everything_already_matches(self) -> None:
+        result = UpdateReviewResult(
+            reviews=[
+                PackageReview(
+                    update=AurUpdate("already-current-pkg", "2.0-1", "2.0-1"),
+                    notes=["Review baseline already matches reviewed metadata."],
+                )
+            ],
+            refresh_requested=True,
+            cache_refresh=True,
+        )
+        report = format_update_review(result)
+
+        self.assertIn("No baseline refreshes needed.", report)
+        self.assertNotIn("Review baselines were not refreshed.", report)
+
     def test_cached_refresh_report_explains_no_refresh_candidates(self) -> None:
         result = UpdateReviewResult(
             reviews=[],
@@ -1316,7 +1332,15 @@ class UpdatesCliTests(unittest.TestCase):
         self.assertEqual(stderr, "")
         self.assertIn("updates", stdout)
         self.assertIn("baseline refresh", stdout)
+        self.assertIn("baseline status", stdout)
         self.assertIn("baseline prune", stdout)
+
+    def test_baseline_help_mentions_status_command(self) -> None:
+        exit_code, stdout, stderr = self.run_cli(["baseline", "--help"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("status", stdout)
 
     def test_updates_helper_error_returns_two(self) -> None:
         with patch("aur_diff_sentinel.cli.discover_updates", side_effect=RuntimeError("no helper")):
@@ -1378,6 +1402,70 @@ class UpdatesCliTests(unittest.TestCase):
             self.assertEqual(stderr, "")
             self.assertIn("Review baselines refreshed: 1", stdout)
             self.assertEqual(cache.baseline_version("example-bin"), "1.1-1")
+
+    def test_baseline_status_reports_no_cached_baselines(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            exit_code, stdout, stderr = self.run_cli(
+                ["baseline", "status", "--cache-dir", temp_dir]
+            )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stderr, "")
+        self.assertIn("Reviewed baselines: 0", stdout)
+        self.assertIn("No reviewed baselines found.", stdout)
+        self.assertIn("No packages were updated.", stdout)
+
+    def test_baseline_status_groups_cached_packages(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            _write_metadata(cache.baseline_dir("current-pkg"), "current-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("current-pkg"), "current-pkg", "1.0", "1")
+            _write_metadata(cache.baseline_dir("pending-pkg"), "pending-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("pending-pkg"), "pending-pkg", "1.1", "1")
+            _write_metadata(cache.baseline_dir("missing-pkg"), "missing-pkg", "2.0", "1")
+            _write_metadata(cache.latest_dir("missing-pkg"), "missing-pkg", "2.0", "1")
+            _write_metadata(cache.baseline_dir("unknown-pkg"), "unknown-pkg", "3.0", "1")
+            _write_metadata(cache.latest_dir("unknown-pkg"), "unknown-pkg", "3.0", "1")
+            incomplete_baseline = cache.baseline_dir("incomplete-pkg")
+            incomplete_latest = cache.latest_dir("incomplete-pkg")
+            incomplete_baseline.mkdir(parents=True)
+            _write_metadata(incomplete_latest, "incomplete-pkg", "4.0", "1")
+
+            def status(package: str) -> InstalledPackageStatus:
+                return {
+                    "current-pkg": InstalledPackageStatus(package, version="1.0-1"),
+                    "pending-pkg": InstalledPackageStatus(package, version="1.0-1"),
+                    "missing-pkg": InstalledPackageStatus(
+                        package,
+                        missing=True,
+                        error="package was not found",
+                    ),
+                    "unknown-pkg": InstalledPackageStatus(
+                        package,
+                        error="pacman database error",
+                    ),
+                }[package]
+
+            with patch("aur_diff_sentinel.baseline_status.query_installed_package", side_effect=status):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "status", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("Reviewed baselines: 5", stdout)
+            self.assertIn("Current:", stdout)
+            self.assertIn("- current-pkg: installed 1.0-1, reviewed 1.0-1", stdout)
+            self.assertIn("Pending reviewed metadata:", stdout)
+            self.assertIn("- pending-pkg: installed 1.0-1, reviewed 1.1-1", stdout)
+            self.assertIn("Not installed:", stdout)
+            self.assertIn("- missing-pkg: reviewed 2.0-1", stdout)
+            self.assertIn("Unknown:", stdout)
+            self.assertIn("- unknown-pkg: pacman database error", stdout)
+            self.assertIn("Incomplete cache:", stdout)
+            self.assertIn("- incomplete-pkg: baseline version could not be determined", stdout)
+            self.assertIn("No packages were updated.", stdout)
 
     def test_baseline_prune_reports_no_missing_cached_packages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

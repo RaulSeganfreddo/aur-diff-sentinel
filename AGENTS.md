@@ -27,6 +27,7 @@ Run from the repository root:
     aur-diff-sentinel --diff tests/samples/suspicious.diff
     aur-diff-sentinel updates
     aur-diff-sentinel baseline refresh
+    aur-diff-sentinel baseline status
     aur-diff-sentinel baseline prune
 
 ## Coding Rules
@@ -47,6 +48,7 @@ Do not claim that “no findings” means safe.
 Keep cache paths configurable with `--cache-dir`.
 The `updates` command may query `paru` or `yay` for pending updates and fetch AUR metadata, but it must not update packages.
 The `baseline refresh` command may query installed versions with `pacman -Q`, but it must only refresh sentinel baselines when reviewed metadata matches the installed package version.
+The `baseline status` command may query installed versions with `pacman -Q`, but it must be read-only.
 The `baseline prune` command must remove only aur-diff-sentinel cache entries for packages no longer installed; it must never remove system packages.
 
 ## Tests
