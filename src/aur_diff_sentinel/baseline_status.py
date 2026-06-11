@@ -23,7 +23,9 @@ class BaselineStatusItem:
 class BaselineStatusResult:
     reviewed_count: int
     current: list[BaselineStatusItem] = field(default_factory=list)
+    ready_to_refresh: list[BaselineStatusItem] = field(default_factory=list)
     pending: list[BaselineStatusItem] = field(default_factory=list)
+    installed_not_reviewed: list[BaselineStatusItem] = field(default_factory=list)
     not_installed: list[BaselineStatusItem] = field(default_factory=list)
     unknown: list[BaselineStatusItem] = field(default_factory=list)
     incomplete: list[BaselineStatusItem] = field(default_factory=list)
@@ -92,23 +94,29 @@ def scan_baseline_status(
             reviewed_version=reviewed_version,
             installed_version=status.version,
         )
-        if status.version == reviewed_version:
+        if status.version == baseline_version and status.version == reviewed_version:
             result.current.append(item)
-        else:
+        elif status.version == reviewed_version:
+            result.ready_to_refresh.append(item)
+        elif status.version == baseline_version:
             result.pending.append(item)
+        else:
+            result.installed_not_reviewed.append(item)
 
     return result
 
 
 def format_baseline_status(result: BaselineStatusResult) -> str:
-    lines = [f"Reviewed baselines: {result.reviewed_count}", ""]
+    lines = [f"Cached baselines: {result.reviewed_count}", ""]
     if result.reviewed_count == 0:
-        lines.append("No reviewed baselines found.")
+        lines.append("No cached baselines found.")
         lines.append("No packages were updated.")
         return "\n".join(lines)
 
     _extend_group(lines, "Current:", result.current, _format_current_item)
+    _extend_group(lines, "Ready to refresh:", result.ready_to_refresh, _format_detailed_item)
     _extend_group(lines, "Pending reviewed metadata:", result.pending, _format_pending_item)
+    _extend_group(lines, "Installed not reviewed:", result.installed_not_reviewed, _format_detailed_item)
     _extend_group(lines, "Not installed:", result.not_installed, _format_not_installed_item)
     _extend_group(lines, "Unknown:", result.unknown, _format_unknown_item)
     _extend_group(lines, "Incomplete cache:", result.incomplete, _format_incomplete_item)
@@ -136,19 +144,26 @@ def _extend_group(
 def _format_current_item(item: BaselineStatusItem) -> str:
     return (
         f"- {item.package}: installed {item.installed_version}, "
-        f"reviewed {item.reviewed_version}"
+        f"baseline {item.baseline_version}"
     )
 
 
 def _format_pending_item(item: BaselineStatusItem) -> str:
+    return _format_detailed_item(item)
+
+
+def _format_detailed_item(item: BaselineStatusItem) -> str:
     return (
         f"- {item.package}: installed {item.installed_version}, "
-        f"reviewed {item.reviewed_version}"
+        f"baseline {item.baseline_version}, reviewed {item.reviewed_version}"
     )
 
 
 def _format_not_installed_item(item: BaselineStatusItem) -> str:
-    return f"- {item.package}: reviewed {item.reviewed_version}"
+    return (
+        f"- {item.package}: baseline {item.baseline_version}, "
+        f"reviewed {item.reviewed_version}"
+    )
 
 
 def _format_unknown_item(item: BaselineStatusItem) -> str:

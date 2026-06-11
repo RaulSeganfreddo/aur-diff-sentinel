@@ -66,9 +66,9 @@ aur-diff-sentinel baseline prune
 aur-diff-sentinel baseline prune --all
 ```
 
-Use `baseline status` to see what reviewed baselines are cached, whether the
-installed versions match reviewed metadata, and which cached packages are no
-longer installed.
+Use `baseline status` to see which baselines are current, which reviewed
+metadata is ready to refresh after a manual update, which reviewed updates are
+still pending, and which cached packages are no longer installed.
 
 If a reviewed package is no longer installed, use `baseline prune` to remove only
 aur-diff-sentinel's cached metadata for that package. The prune command never

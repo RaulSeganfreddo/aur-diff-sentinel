@@ -1531,8 +1531,8 @@ class UpdatesCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 0)
         self.assertEqual(stderr, "")
-        self.assertIn("Reviewed baselines: 0", stdout)
-        self.assertIn("No reviewed baselines found.", stdout)
+        self.assertIn("Cached baselines: 0", stdout)
+        self.assertIn("No cached baselines found.", stdout)
         self.assertIn("No packages were updated.", stdout)
 
     def test_baseline_status_groups_cached_packages(self) -> None:
@@ -1541,8 +1541,12 @@ class UpdatesCliTests(unittest.TestCase):
             cache = AurCache(root)
             _write_metadata(cache.baseline_dir("current-pkg"), "current-pkg", "1.0", "1")
             _write_metadata(cache.latest_dir("current-pkg"), "current-pkg", "1.0", "1")
+            _write_metadata(cache.baseline_dir("ready-pkg"), "ready-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("ready-pkg"), "ready-pkg", "1.1", "1")
             _write_metadata(cache.baseline_dir("pending-pkg"), "pending-pkg", "1.0", "1")
             _write_metadata(cache.latest_dir("pending-pkg"), "pending-pkg", "1.1", "1")
+            _write_metadata(cache.baseline_dir("unreviewed-pkg"), "unreviewed-pkg", "1.0", "1")
+            _write_metadata(cache.latest_dir("unreviewed-pkg"), "unreviewed-pkg", "1.1", "1")
             _write_metadata(cache.baseline_dir("missing-pkg"), "missing-pkg", "2.0", "1")
             _write_metadata(cache.latest_dir("missing-pkg"), "missing-pkg", "2.0", "1")
             _write_metadata(cache.baseline_dir("unknown-pkg"), "unknown-pkg", "3.0", "1")
@@ -1555,7 +1559,9 @@ class UpdatesCliTests(unittest.TestCase):
             def status(package: str) -> InstalledPackageStatus:
                 return {
                     "current-pkg": InstalledPackageStatus(package, version="1.0-1"),
+                    "ready-pkg": InstalledPackageStatus(package, version="1.1-1"),
                     "pending-pkg": InstalledPackageStatus(package, version="1.0-1"),
+                    "unreviewed-pkg": InstalledPackageStatus(package, version="1.2-1"),
                     "missing-pkg": InstalledPackageStatus(
                         package,
                         missing=True,
@@ -1574,13 +1580,26 @@ class UpdatesCliTests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertEqual(stderr, "")
-            self.assertIn("Reviewed baselines: 5", stdout)
+            self.assertIn("Cached baselines: 7", stdout)
             self.assertIn("Current:", stdout)
-            self.assertIn("- current-pkg: installed 1.0-1, reviewed 1.0-1", stdout)
+            self.assertIn("- current-pkg: installed 1.0-1, baseline 1.0-1", stdout)
+            self.assertIn("Ready to refresh:", stdout)
+            self.assertIn(
+                "- ready-pkg: installed 1.1-1, baseline 1.0-1, reviewed 1.1-1",
+                stdout,
+            )
             self.assertIn("Pending reviewed metadata:", stdout)
-            self.assertIn("- pending-pkg: installed 1.0-1, reviewed 1.1-1", stdout)
+            self.assertIn(
+                "- pending-pkg: installed 1.0-1, baseline 1.0-1, reviewed 1.1-1",
+                stdout,
+            )
+            self.assertIn("Installed not reviewed:", stdout)
+            self.assertIn(
+                "- unreviewed-pkg: installed 1.2-1, baseline 1.0-1, reviewed 1.1-1",
+                stdout,
+            )
             self.assertIn("Not installed:", stdout)
-            self.assertIn("- missing-pkg: reviewed 2.0-1", stdout)
+            self.assertIn("- missing-pkg: baseline 2.0-1, reviewed 2.0-1", stdout)
             self.assertIn("Unknown:", stdout)
             self.assertIn("- unknown-pkg: pacman database error", stdout)
             self.assertIn("Incomplete cache:", stdout)
