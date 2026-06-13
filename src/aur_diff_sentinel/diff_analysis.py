@@ -11,7 +11,7 @@ from aur_diff_sentinel.models import Finding, Severity
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 ARRAY_START_RE = re.compile(
-    r"^\s*(source(?:_[a-z0-9_]+)?|depends(?:_[a-z0-9_]+)?|makedepends(?:_[a-z0-9_]+)?|checkdepends(?:_[a-z0-9_]+)?|optdepends(?:_[a-z0-9_]+)?|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
+    r"^\s*(source(?:_[a-z0-9_]+)?|depends(?:_[a-z0-9_]+)?|makedepends(?:_[a-z0-9_]+)?|checkdepends(?:_[a-z0-9_]+)?|optdepends(?:_[a-z0-9_]+)?|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*(\+?=)\s*(.*)$",
     re.IGNORECASE,
 )
 SOURCE_ARRAY_RE = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.IGNORECASE)
@@ -334,7 +334,7 @@ def _consume_changed_line(
     if active_block is not None:
         active_block.lines.append((line_number, content))
         active_block.changed = True
-        if ")" in content:
+        if _has_unquoted_closing_paren(content):
             array = _array_from_block(active_block)
             changed_arrays.append(array)
             state_arrays.append(array)
@@ -346,7 +346,7 @@ def _consume_changed_line(
         return
 
     name = match.group(1)
-    rest = match.group(2)
+    rest = match.group(3)
     block = ArrayBlock(
         name=name,
         sign=sign,
@@ -356,7 +356,7 @@ def _consume_changed_line(
         lines=[(line_number, content)],
     )
 
-    if "(" in rest and ")" not in rest:
+    if "(" in rest and not _has_unquoted_closing_paren(rest):
         active_blocks[sign] = block
         return
 
@@ -388,7 +388,7 @@ def _consume_context_line(
         active_block = active_blocks[sign]
         if active_block is not None:
             active_block.lines.append((line_number, content))
-            if ")" in content:
+            if _has_unquoted_closing_paren(content):
                 array = _array_from_block(active_block)
                 if active_block.changed:
                     changed_arrays.append(array)
@@ -400,8 +400,8 @@ def _consume_context_line(
         if not match:
             continue
 
-        rest = match.group(2)
-        if "(" in rest and ")" not in rest:
+        rest = match.group(3)
+        if "(" in rest and not _has_unquoted_closing_paren(rest):
             active_blocks[sign] = ArrayBlock(
                 name=match.group(1),
                 sign=sign,
@@ -458,14 +458,42 @@ def _array_values_from_line(content: str) -> list[str]:
 
 
 def _array_value_text(content: str) -> str:
-    if "=" in content:
-        content = content.split("=", maxsplit=1)[1]
+    assignment = ARRAY_START_RE.match(content)
+    if assignment:
+        content = assignment.group(3)
     content = content.strip()
     if content.startswith("("):
         content = content[1:]
-    if ")" in content:
-        content = content.split(")", maxsplit=1)[0]
+    closing_paren_index = _unquoted_closing_paren_index(content)
+    if closing_paren_index is not None:
+        content = content[:closing_paren_index]
     return content.strip()
+
+
+def _has_unquoted_closing_paren(content: str) -> bool:
+    return _unquoted_closing_paren_index(content) is not None
+
+
+def _unquoted_closing_paren_index(content: str) -> int | None:
+    quote: str | None = None
+    escape = False
+    for index, char in enumerate(content):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            continue
+        if char == ")":
+            return index
+    return None
 
 
 def _compare_source_urls(

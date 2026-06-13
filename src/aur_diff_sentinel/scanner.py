@@ -7,9 +7,10 @@ from aur_diff_sentinel.diff_analysis import analyze_source_diff
 from aur_diff_sentinel.models import Finding, Rule, Severity, SourceLine
 from aur_diff_sentinel.pkgbuild_analysis import analyze_pkgbuild_checksums
 from aur_diff_sentinel.rules import RULES
-from aur_diff_sentinel.rules import changes_to_non_temp_dir as _changes_to_non_temp_dir
-from aur_diff_sentinel.rules import changes_to_temp_dir as _changes_to_temp_dir
-from aur_diff_sentinel.rules import uses_js_package_manager as _uses_js_package_manager
+from aur_diff_sentinel.rules import is_cd_to_non_temp_dir as _is_cd_to_non_temp_dir
+from aur_diff_sentinel.rules import is_cd_to_temp_dir as _is_cd_to_temp_dir
+from aur_diff_sentinel.rules import is_js_package_manager_command as _is_js_package_manager_command
+from aur_diff_sentinel.rules import shell_commands as _shell_commands
 
 
 HUNK_HEADER_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
@@ -294,38 +295,41 @@ def _sequence_findings(lines: list[SourceLine]) -> list[Finding]:
         if _is_full_line_comment(line.content):
             continue
         block_key = _sequence_block_key(line)
-        same_line_temp_dir = _changes_to_temp_dir(line.content)
-        if line.execution_context in {"scriptlet", "hook"} and _changes_to_temp_dir(line.content):
-            working_directory_by_block[block_key] = "temporary"
-        elif line.execution_context in {"scriptlet", "hook"} and _changes_to_non_temp_dir(line.content):
-            working_directory_by_block[block_key] = "non-temporary"
-        if (
-            line.execution_context in {"scriptlet", "hook"}
-            and _uses_js_package_manager(line.content)
-            and (working_directory_by_block.get(block_key) == "temporary" or same_line_temp_dir)
-            and block_key not in seen_temp_package_install
-        ):
-            findings.append(
-                Finding(
-                    rule_id="temporary-directory-package-install",
-                    severity=Severity.HIGH,
-                    message="Package manager runs from a temporary directory",
-                    line_number=line.line_number,
-                    line_content=line.content,
-                    hint=(
-                        "Installing packages from /tmp or /var/tmp in an install script "
-                        "or pacman hook runs on the live system and needs review."
-                    ),
-                    filename=line.filename,
-                    source_type=line.source_type,
-                    diff_line_number=line.diff_line_number,
-                    target_line_number=line.target_line_number,
-                    change_type=line.change_type,
-                    function_name=line.function_name,
-                    execution_context=line.execution_context,
+        if line.execution_context not in {"scriptlet", "hook"}:
+            continue
+        for command in _shell_commands(line.content):
+            if _is_cd_to_temp_dir(command):
+                working_directory_by_block[block_key] = "temporary"
+                continue
+            if _is_cd_to_non_temp_dir(command):
+                working_directory_by_block[block_key] = "non-temporary"
+                continue
+            if (
+                _is_js_package_manager_command(command)
+                and working_directory_by_block.get(block_key) == "temporary"
+                and block_key not in seen_temp_package_install
+            ):
+                findings.append(
+                    Finding(
+                        rule_id="temporary-directory-package-install",
+                        severity=Severity.HIGH,
+                        message="Package manager runs from a temporary directory",
+                        line_number=line.line_number,
+                        line_content=line.content,
+                        hint=(
+                            "Installing packages from /tmp or /var/tmp in an install script "
+                            "or pacman hook runs on the live system and needs review."
+                        ),
+                        filename=line.filename,
+                        source_type=line.source_type,
+                        diff_line_number=line.diff_line_number,
+                        target_line_number=line.target_line_number,
+                        change_type=line.change_type,
+                        function_name=line.function_name,
+                        execution_context=line.execution_context,
+                    )
                 )
-            )
-            seen_temp_package_install.add(block_key)
+                seen_temp_package_install.add(block_key)
 
     return findings
 

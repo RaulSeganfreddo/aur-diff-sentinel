@@ -442,6 +442,48 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("scriptlet-package-manager", ids)
         self.assertNotIn("temporary-directory-package-install", ids)
 
+    def test_temp_directory_subdirectories_are_treated_as_temporary(self) -> None:
+        for command in (
+            "cd /tmp/payload\n    npm install package",
+            "cd /var/tmp/build-dir\n    bun add package",
+        ):
+            with self.subTest(command=command):
+                findings = scan_text(
+                    "\n".join(
+                        [
+                            "post_install() {",
+                            f"    {command}",
+                            "}",
+                        ]
+                    ),
+                    filename="example.install",
+                )
+                ids = {finding.rule_id for finding in findings}
+
+                self.assertIn("scriptlet-package-manager", ids)
+                self.assertIn("temporary-directory-package-install", ids)
+
+    def test_same_line_temp_directory_state_follows_command_order(self) -> None:
+        for command in (
+            "npm install package && cd /tmp",
+            "cd /tmp && cd /usr/share/example && npm install package",
+        ):
+            with self.subTest(command=command):
+                findings = scan_text(
+                    "\n".join(
+                        [
+                            "post_install() {",
+                            f"    {command}",
+                            "}",
+                        ]
+                    ),
+                    filename="example.install",
+                )
+                ids = {finding.rule_id for finding in findings}
+
+                self.assertIn("scriptlet-package-manager", ids)
+                self.assertNotIn("temporary-directory-package-install", ids)
+
     def test_hook_temp_directory_state_does_not_cross_exec_lines(self) -> None:
         findings = scan_text(
             "\n".join(
@@ -479,8 +521,50 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("scriptlet-package-manager", ids)
         self.assertIn("temporary-directory-package-install", ids)
 
+    def test_env_and_command_options_before_package_manager_are_detected(self) -> None:
+        for command in (
+            "env HOME=/tmp npm install package",
+            "env -i npm install package",
+            "env -- npm install package",
+            "command -- bun add package",
+            "command -p bun add package",
+        ):
+            with self.subTest(command=command):
+                ids = {
+                    finding.rule_id
+                    for finding in scan_text(
+                        "\n".join(
+                            [
+                                "post_install() {",
+                                f"    {command}",
+                                "}",
+                            ]
+                        ),
+                        filename="example.install",
+                    )
+                }
+
+                self.assertIn("scriptlet-package-manager", ids)
+
+    def test_command_query_does_not_match_package_manager_execution(self) -> None:
+        ids = {
+            finding.rule_id
+            for finding in scan_text(
+                "\n".join(
+                    [
+                        "post_install() {",
+                        "    command -v bun",
+                        "}",
+                    ]
+                ),
+                filename="example.install",
+            )
+        }
+
+        self.assertNotIn("scriptlet-package-manager", ids)
+
     def test_direct_exec_package_managers_are_high(self) -> None:
-        for command in ("npx example", "bunx example", "pnpm exec example"):
+        for command in ("npx example", "bunx example", "npm exec example", "yarn dlx example", "pnpm exec example", "pnpm dlx example"):
             with self.subTest(command=command):
                 finding = next(
                     finding
@@ -489,6 +573,25 @@ class ScannerTests(unittest.TestCase):
                 )
 
                 self.assertEqual(finding.severity, Severity.HIGH)
+
+    def test_package_manager_aliases_are_detected(self) -> None:
+        for command in ("npm i package", "bun i package"):
+            with self.subTest(command=command):
+                ids = {
+                    finding.rule_id
+                    for finding in scan_text(
+                        "\n".join(
+                            [
+                                "post_install() {",
+                                f"    {command}",
+                                "}",
+                            ]
+                        ),
+                        filename="example.install",
+                    )
+                }
+
+                self.assertIn("scriptlet-package-manager", ids)
 
     def test_network_in_build_ignores_top_level_sources(self) -> None:
         ids = rule_ids('source=("https://example.com/file.tar.gz")')
@@ -906,6 +1009,68 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual(finding.new_value, "nodejs")
         self.assertIn("makedepends", finding.message)
+
+    def test_diff_incremental_javascript_tooling_dependency_added_is_detected(self) -> None:
+        for added_line, expected in (
+            ("+depends+=(bun)", "bun"),
+            ("+makedepends_x86_64+=(nodejs)", "nodejs"),
+        ):
+            with self.subTest(added_line=added_line):
+                text = "\n".join(
+                    [
+                        "diff --git a/PKGBUILD b/PKGBUILD",
+                        "--- a/PKGBUILD",
+                        "+++ b/PKGBUILD",
+                        "@@ -1 +1,2 @@",
+                        " depends=(foo)",
+                        added_line,
+                    ]
+                )
+                finding = next(
+                    finding
+                    for finding in scan_diff_text(text)
+                    if finding.rule_id == "javascript-tooling-dependency-added"
+                )
+
+                self.assertEqual(finding.new_value, expected)
+
+    def test_diff_quoted_parentheses_in_dependency_values_are_preserved(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-optdepends=(foo)",
+                "+optdepends=('nodejs: optional integration (experimental)' foo)",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "javascript-tooling-dependency-added"
+        )
+
+        self.assertEqual(finding.new_value, "nodejs")
+
+    def test_diff_quoted_parentheses_in_source_values_are_preserved(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                '-source=("https://old.example/archive.tar.gz")',
+                '+source=("https://example.org/archive_(x86_64).tar.gz")',
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "source-domain-changed"
+        )
+
+        self.assertEqual(finding.new_value, "https://example.org/archive_(x86_64).tar.gz")
 
     def test_diff_generic_dependency_added_is_not_reported(self) -> None:
         text = "\n".join(

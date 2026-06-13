@@ -44,15 +44,15 @@ def _network_in_build(line: SourceLine) -> bool:
 
 
 def uses_js_package_manager(content: str) -> bool:
-    return any(_is_js_package_manager_command(tokens) for tokens in _shell_commands(content))
+    return any(is_js_package_manager_command(tokens) for tokens in shell_commands(content))
 
 
 def changes_to_temp_dir(content: str) -> bool:
-    return any(_is_cd_to_temp_dir(tokens) for tokens in _shell_commands(content))
+    return any(is_cd_to_temp_dir(tokens) for tokens in shell_commands(content))
 
 
 def changes_to_non_temp_dir(content: str) -> bool:
-    return any(_is_cd_to_non_temp_dir(tokens) for tokens in _shell_commands(content))
+    return any(is_cd_to_non_temp_dir(tokens) for tokens in shell_commands(content))
 
 
 def _scriptlet_package_manager(line: SourceLine) -> bool:
@@ -60,14 +60,14 @@ def _scriptlet_package_manager(line: SourceLine) -> bool:
 
 
 def _direct_exec_package_manager(line: SourceLine) -> bool:
-    return any(_is_direct_exec_package_manager(tokens) for tokens in _shell_commands(line.content))
+    return any(is_direct_exec_package_manager(tokens) for tokens in shell_commands(line.content))
 
 
 def _pacman_hook_exec(line: SourceLine) -> bool:
     return line.execution_context == "hook" and HOOK_EXEC_RE.match(line.content) is not None
 
 
-def _shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
+def shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
     if depth > 2:
         return []
 
@@ -80,7 +80,7 @@ def _shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
             continue
         shell_payload = _shell_c_payload(tokens)
         if shell_payload is not None:
-            commands.extend(_shell_commands(shell_payload, depth=depth + 1))
+            commands.extend(shell_commands(shell_payload, depth=depth + 1))
             continue
         commands.append(tokens)
     return commands
@@ -150,9 +150,52 @@ def _strip_command_prefix(tokens: list[str]) -> list[str]:
     index = 0
     while index < len(tokens) and ASSIGNMENT_RE.match(tokens[index]):
         index += 1
-    while index < len(tokens) and _command_name(tokens[index]) in {"env", "command"}:
-        index += 1
+    while index < len(tokens):
+        command = _command_name(tokens[index])
+        if command == "env":
+            index = _strip_env_prefix(tokens, index + 1)
+            continue
+        if command == "command":
+            index = _strip_command_builtin_prefix(tokens, index + 1)
+            continue
+        break
     return tokens[index:]
+
+
+def _strip_env_prefix(tokens: list[str], index: int) -> int:
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if token in {"-i", "--ignore-environment", "-0", "--null"}:
+            index += 1
+            continue
+        if token in {"-u", "--unset"}:
+            index += 2
+            continue
+        if token.startswith("-u") and token != "-u":
+            index += 1
+            continue
+        if token.startswith("--unset="):
+            index += 1
+            continue
+        if ASSIGNMENT_RE.match(token):
+            index += 1
+            continue
+        break
+    return index
+
+
+def _strip_command_builtin_prefix(tokens: list[str], index: int) -> int:
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            return index + 1
+        if token in {"-p"}:
+            index += 1
+            continue
+        break
+    return index
 
 
 def _shell_c_payload(tokens: list[str]) -> str | None:
@@ -177,45 +220,50 @@ def _command_name(token: str) -> str:
     return os.path.basename(token).lower()
 
 
-def _is_js_package_manager_command(tokens: list[str]) -> bool:
+def is_js_package_manager_command(tokens: list[str]) -> bool:
     command = _command_name(tokens[0])
     args = [token.lower() for token in tokens[1:]]
     if command == "npm":
-        return bool(args) and args[0] in {"install", "add", "ci"}
+        return bool(args) and args[0] in {"install", "add", "ci", "i", "exec"}
     if command == "npx":
         return True
     if command == "bun":
-        return bool(args) and args[0] in {"add", "install"}
+        return bool(args) and args[0] in {"add", "install", "i"}
     if command == "bunx":
         return True
     if command == "yarn":
-        return not args or args[0] in {"add", "install"}
+        return not args or args[0] in {"add", "install", "dlx"}
     if command == "pnpm":
-        return bool(args) and args[0] in {"add", "install", "exec"}
+        return bool(args) and args[0] in {"add", "install", "exec", "dlx"}
     return False
 
 
-def _is_direct_exec_package_manager(tokens: list[str]) -> bool:
+def is_direct_exec_package_manager(tokens: list[str]) -> bool:
     command = _command_name(tokens[0])
     args = [token.lower() for token in tokens[1:]]
-    return command in {"npx", "bunx"} or (command == "pnpm" and bool(args) and args[0] == "exec")
+    return (
+        command in {"npx", "bunx"}
+        or (command == "npm" and bool(args) and args[0] == "exec")
+        or (command == "yarn" and bool(args) and args[0] == "dlx")
+        or (command == "pnpm" and bool(args) and args[0] in {"exec", "dlx"})
+    )
 
 
-def _is_cd_to_temp_dir(tokens: list[str]) -> bool:
-    return _is_cd_to_path(tokens, {"/tmp", "/var/tmp"})
-
-
-def _is_cd_to_non_temp_dir(tokens: list[str]) -> bool:
+def is_cd_to_temp_dir(tokens: list[str]) -> bool:
     if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
         return False
-    path = tokens[1].rstrip("/")
-    return path not in {"/tmp", "/var/tmp"}
+    return _is_temp_path(tokens[1])
 
 
-def _is_cd_to_path(tokens: list[str], paths: set[str]) -> bool:
+def is_cd_to_non_temp_dir(tokens: list[str]) -> bool:
     if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
         return False
-    return tokens[1].rstrip("/") in paths
+    return not _is_temp_path(tokens[1])
+
+
+def _is_temp_path(path: str) -> bool:
+    normalized = path.rstrip("/")
+    return normalized in {"/tmp", "/var/tmp"} or normalized.startswith("/tmp/") or normalized.startswith("/var/tmp/")
 
 
 def _is_sensitive_path(token: str) -> bool:
