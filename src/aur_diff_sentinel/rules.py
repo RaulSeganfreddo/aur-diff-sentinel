@@ -7,14 +7,50 @@ from aur_diff_sentinel.models import Rule, Severity, SourceLine
 
 
 BUILD_FUNCTIONS = {"prepare", "build", "check", "package"}
+SCRIPTLET_CONTEXTS = {"scriptlet", "hook"}
 SENSITIVE_PATH_PREFIXES = ("/usr", "/etc", "/var", "/home", "/root")
+
+COMMAND_PREFIX = (
+    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
+    r"(?:(?:/usr/bin/|/bin/)?(?:env|command)\s+)*"
+    r"(?:/usr/bin/|/bin/)?"
+)
+COMMAND_BOUNDARY = r"(?:^\s*|[;&|]\s*)"
+JS_PACKAGE_MANAGER_COMMAND_RE = re.compile(
+    COMMAND_BOUNDARY
+    + COMMAND_PREFIX
+    + r"(?:"
+    r"npm\s+(?:install|add|ci)(?:\s|$)|"
+    r"npx(?:\s|$)|"
+    r"bun\s+(?:add|install)(?:\s|$)|"
+    r"bunx(?:\s|$)|"
+    r"yarn(?:\s+(?:add|install))?(?:\s|$)|"
+    r"pnpm\s+(?:add|install|exec)(?:\s|$)"
+    r")",
+    re.IGNORECASE,
+)
+DIRECT_EXEC_PACKAGE_MANAGER_RE = re.compile(
+    COMMAND_BOUNDARY + COMMAND_PREFIX + r"(?:npx|bunx|pnpm\s+exec)(?:\s|$)",
+    re.IGNORECASE,
+)
+TEMP_DIR_RE = re.compile(
+    r"(?:^\s*|[;&|]\s*|(?:/usr/bin/|/bin/)?(?:ba)?sh\s+-c\s*['\"]\s*)"
+    r"cd\s+['\"]?(?:/tmp|/var/tmp)(?:/|['\"\s;&|]|$)",
+    re.IGNORECASE,
+)
+HOOK_EXEC_RE = re.compile(r"^\s*Exec\s*=", re.IGNORECASE)
 
 NETWORK_IN_BUILD_RE = re.compile(
     r"(^\s*|[;&|]\s*)("
     r"curl(\s|$)|"
     r"wget(\s|$)|"
     r"git\s+clone(\s|$)|"
-    r"npm\s+install(\s|$)|"
+    r"(?:/usr/bin/)?npm\s+(install|add|ci)(\s|$)|"
+    r"(?:/usr/bin/)?npx(\s|$)|"
+    r"(?:/usr/bin/)?bun\s+(add|install)(\s|$)|"
+    r"(?:/usr/bin/)?bunx(\s|$)|"
+    r"(?:/usr/bin/)?yarn(\s+(add|install))?(\s|$)|"
+    r"(?:/usr/bin/)?pnpm\s+(add|install|exec)(\s|$)|"
     r"pip[0-9.]*\s+install(\s|$)|"
     r"go\s+get(\s|$)|"
     r"cargo\s+install(\s|$)"
@@ -28,11 +64,34 @@ REDIRECT_TO_SENSITIVE_PATH_RE = re.compile(
 
 
 def _is_build_function(line: SourceLine) -> bool:
-    return line.function_name in BUILD_FUNCTIONS
+    return line.execution_context == "build" or line.function_name in BUILD_FUNCTIONS
 
 
 def _network_in_build(line: SourceLine) -> bool:
-    return _is_build_function(line) and NETWORK_IN_BUILD_RE.search(line.content) is not None
+    return _is_build_function(line) and (
+        NETWORK_IN_BUILD_RE.search(line.content) is not None
+        or JS_PACKAGE_MANAGER_COMMAND_RE.search(line.content) is not None
+    )
+
+
+def uses_js_package_manager(content: str) -> bool:
+    return JS_PACKAGE_MANAGER_COMMAND_RE.search(content) is not None
+
+
+def changes_to_temp_dir(content: str) -> bool:
+    return TEMP_DIR_RE.search(content) is not None
+
+
+def _scriptlet_package_manager(line: SourceLine) -> bool:
+    return line.execution_context in SCRIPTLET_CONTEXTS and uses_js_package_manager(line.content)
+
+
+def _direct_exec_package_manager(line: SourceLine) -> bool:
+    return DIRECT_EXEC_PACKAGE_MANAGER_RE.search(line.content) is not None
+
+
+def _pacman_hook_exec(line: SourceLine) -> bool:
+    return line.execution_context == "hook" and HOOK_EXEC_RE.match(line.content) is not None
 
 
 def _is_sensitive_path(token: str) -> bool:
@@ -129,14 +188,21 @@ RULES: list[Rule] = [
     Rule.regex(
         id="install-script",
         severity=Severity.MEDIUM,
-        pattern=r"^\s*install\s*=\s*['\"]?[^'\"\s#]+\.install['\"]?",
+        pattern=r"^\s*install\s*=\s*['\"]?[^'\"\s#]+['\"]?",
         message="Install script referenced",
-        hint=".install scripts can run during install, upgrade, and removal.",
+        hint="Install scripts can run during install, upgrade, and removal on the live system.",
+    ),
+    Rule.contextual(
+        id="pacman-hook-exec",
+        severity=Severity.MEDIUM,
+        matcher=_pacman_hook_exec,
+        message="Pacman hook action detected",
+        hint="Pacman hooks can run automatically during package transactions.",
     ),
     Rule.regex(
         id="shell-c",
         severity=Severity.MEDIUM,
-        pattern=r"(^\s*|[;&|]\s*)((ba)?sh)\s+-c(\s|$)",
+        pattern=r"(^\s*|[;&|]\s*)((/usr/bin/|/bin/)?(ba)?sh)\s+-c(\s|$)",
         message="Dynamic shell execution detected",
         hint="sh -c and bash -c can hide complex generated command execution.",
     ),
@@ -160,6 +226,20 @@ RULES: list[Rule] = [
         pattern=r"(\bpython[0-9.]*\s+-c\b|\bperl\s+-e\b|\bawk\b.*\bsystem\s*\()",
         message="Inline interpreter command detected",
         hint="Inline interpreter commands can hide meaningful behavior in compact code.",
+    ),
+    Rule.contextual(
+        id="scriptlet-package-manager",
+        severity=Severity.HIGH,
+        matcher=_scriptlet_package_manager,
+        message="Package manager command in install script or hook",
+        hint="Package-manager commands in install scripts or pacman hooks run on the live system and can execute downloaded code.",
+    ),
+    Rule.contextual(
+        id="direct-exec-package-manager",
+        severity=Severity.HIGH,
+        matcher=_direct_exec_package_manager,
+        message="Package manager command may download and execute code",
+        hint="Commands such as npx, bunx, and pnpm exec can fetch and execute code directly.",
     ),
     Rule.contextual(
         id="network-in-build",

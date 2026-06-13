@@ -88,11 +88,16 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - setuid/setgid permissions
 - privilege or live-system commands
 - `.install` script references
+- new install script and pacman hook files
 - `sh -c` / `bash -c`
 - shell `source` commands
 - decoded content piped into shells
 - compact inline interpreter commands
 - network activity inside build functions
+- package manager commands in install scripts and pacman hooks
+- package manager commands run from temporary directories in live-system contexts
+- JavaScript tooling dependencies added in update diffs
+- combined live-system install sequences made from multiple review signals
 - obvious writes outside `$pkgdir`
 - newly added source URLs in diffs
 - source domain changes in diffs
@@ -147,6 +152,7 @@ Important limits:
 - it only compares simple source and checksum arrays
 - checksum consistency checks are conservative and diff-focused
 - it relies on `paru` or `yay` only for update discovery
+- `updates` can miss AUR metadata changes when `pkgver` and `pkgrel` are unchanged
 - it does not inspect downloaded source archives
 - it does not install, build, or update packages
 - `baseline prune` removes only this tool's cached metadata

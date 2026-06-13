@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -11,6 +12,8 @@ from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 
 
 InstalledVersionGetter = Callable[[str], str | None]
+MAX_METADATA_SCAN_BYTES = 512 * 1024
+INSTALL_FIELD_RE = re.compile(r"^\s*install\s*=\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 
 
 @dataclass(frozen=True)
@@ -217,17 +220,48 @@ def _scan_latest_metadata(latest_dir: Path) -> list[Finding]:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        findings.extend(scan_text(text, filename=path.name))
+        findings.extend(scan_text(text, filename=path.relative_to(latest_dir).as_posix()))
     return findings
 
 
 def _metadata_scan_paths(latest_dir: Path) -> list[Path]:
     if not latest_dir.exists():
         return []
-    return [
-        path
-        for path in latest_dir.rglob("*")
-        if path.is_file()
-        and ".git" not in path.relative_to(latest_dir).parts
-        and (path.name == "PKGBUILD" or path.name.endswith(".install"))
-    ]
+    install_references = _install_references(latest_dir)
+    paths: list[Path] = []
+    for path in latest_dir.rglob("*"):
+        if not _is_scannable_metadata_path(latest_dir, path):
+            continue
+        relative_path = path.relative_to(latest_dir)
+        if (
+            path.name in {"PKGBUILD", ".SRCINFO"}
+            or path.name.endswith(".install")
+            or path.name.endswith(".hook")
+            or relative_path.as_posix() in install_references
+            or path.name in install_references
+        ):
+            paths.append(path)
+    return paths
+
+
+def _install_references(latest_dir: Path) -> set[str]:
+    pkgbuild = latest_dir / "PKGBUILD"
+    if not pkgbuild.exists() or pkgbuild.is_symlink():
+        return set()
+    try:
+        text = pkgbuild.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    return {match.group(1) for match in INSTALL_FIELD_RE.finditer(text)}
+
+
+def _is_scannable_metadata_path(root: Path, path: Path) -> bool:
+    if not path.is_file() or path.is_symlink():
+        return False
+    relative_path = path.relative_to(root)
+    if ".git" in relative_path.parts:
+        return False
+    try:
+        return path.stat().st_size <= MAX_METADATA_SCAN_BYTES
+    except OSError:
+        return False

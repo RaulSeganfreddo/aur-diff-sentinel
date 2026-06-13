@@ -16,6 +16,18 @@ REASON_PHRASES = {
     "checksum-count-mismatch": "source/checksum count mismatch",
     "checksum-skip": "checksum verification skipped",
     "install-script": "install script referenced",
+    "install-script-added": "install script added",
+    "pacman-hook-added": "pacman hook added",
+    "pacman-hook-exec": "pacman hook action",
+    "scriptlet-package-manager": "package manager in live script",
+    "temporary-directory-package-install": "package install from temporary directory",
+    "direct-exec-package-manager": "package manager direct execution",
+    "suspicious-runtime-dependency-added": "JavaScript tooling dependency added",
+    "dependency-moved": "dependency moved",
+    "dependency-removed": "dependency removed",
+    "aur-metadata-executable-added": "executable metadata file added",
+    "aur-metadata-elf-added": "ELF metadata file added",
+    "suspicious-live-install-sequence": "combined live install sequence",
     "eval-used": "eval used",
     "curl-pipe-shell": "remote download piped to shell",
     "setuid-permission": "setuid/setgid permission",
@@ -47,6 +59,8 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
                 lines.append(_format_finding(finding))
                 if verbose:
                     lines.append(f"  line: {finding.line_content}")
+                    if finding.execution_context or finding.function_name:
+                        lines.append(f"  context: {_finding_context(finding)}")
                     if finding.old_value is not None:
                         lines.append(f"  old: {finding.old_value}")
                     if finding.new_value is not None:
@@ -234,6 +248,15 @@ def _indent(text: str) -> str:
 
 def _format_finding(finding: Finding) -> str:
     return f"- {_location(finding)} {finding.rule_id:<26} {finding.message}"
+
+
+def _finding_context(finding: Finding) -> str:
+    parts: list[str] = []
+    if finding.function_name:
+        parts.append(finding.function_name)
+    if finding.execution_context:
+        parts.append(f"({finding.execution_context})")
+    return " ".join(parts) if parts else "unknown"
 
 
 def _location(finding: Finding) -> str:

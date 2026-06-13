@@ -229,6 +229,150 @@ class ScannerTests(unittest.TestCase):
 
         self.assertIn("network-in-build", ids)
 
+    def test_scriptlet_package_manager_is_detected_with_temp_directory(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "post_install() {{",
+                    "    cd /tmp",
+                    "    bun add lodash js-digest",
+                    "}}",
+                ]
+            ),
+            filename="example.install",
+        )
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertIn("temporary-directory-package-install", ids)
+        self.assertEqual(
+            next(finding for finding in findings if finding.rule_id == "scriptlet-package-manager").function_name,
+            "post_install",
+        )
+
+    def test_function_style_scriptlet_is_tracked(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "function post_install {",
+                    "    npm install atomic-lockfile",
+                    "}",
+                ]
+            ),
+            filename="example.install",
+        )
+        finding = next(
+            finding
+            for finding in findings
+            if finding.rule_id == "scriptlet-package-manager"
+        )
+
+        self.assertEqual(finding.function_name, "post_install")
+        self.assertEqual(finding.execution_context, "scriptlet")
+
+    def test_npm_scriptlet_package_manager_is_detected(self) -> None:
+        ids = {
+            finding.rule_id
+            for finding in scan_text(
+                "\n".join(
+                    [
+                        "post_install() {",
+                        "    cd /tmp",
+                        "    npm install atomic-lockfile yargs",
+                        "}",
+                    ]
+                ),
+                filename="example.install",
+            )
+        }
+
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertIn("temporary-directory-package-install", ids)
+
+    def test_pacman_hook_exec_package_manager_is_detected(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "[Action]",
+                    "Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'",
+                ]
+            ),
+            filename="example.hook",
+        )
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("pacman-hook-exec", ids)
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertIn("temporary-directory-package-install", ids)
+        self.assertTrue(all(finding.execution_context == "hook" for finding in findings))
+
+    def test_legitimate_install_script_without_package_manager_is_not_high(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "post_install() {",
+                    '    echo "Custom flags belong in ~/.config/example-flags.conf"',
+                    "}",
+                    "",
+                    "post_upgrade() {",
+                    "    post_install",
+                    "}",
+                ]
+            ),
+            filename="example.install",
+        )
+
+        self.assertNotIn(
+            "scriptlet-package-manager",
+            {finding.rule_id for finding in findings},
+        )
+        self.assertFalse(any(finding.severity == Severity.HIGH for finding in findings))
+
+    def test_comments_and_strings_do_not_match_package_manager_rules(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "# npm install atomic-lockfile",
+                    'message="run bun add manually"',
+                ]
+            ),
+            filename="example.install",
+        )
+
+        self.assertEqual(findings, [])
+
+    def test_absolute_env_and_command_package_manager_forms_are_detected(self) -> None:
+        ids = {
+            finding.rule_id
+            for finding in scan_text(
+                "\n".join(
+                    [
+                        "post_install() {",
+                        "    cd /tmp && /usr/bin/npm install atomic-lockfile",
+                        "    /usr/bin/bun add js-digest",
+                        "    env npm install atomic-lockfile",
+                        "    command bun add js-digest",
+                        "}",
+                    ]
+                ),
+                filename="example.install",
+            )
+        }
+
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertIn("temporary-directory-package-install", ids)
+
+    def test_direct_exec_package_managers_are_high(self) -> None:
+        for command in ("npx example", "bunx example", "pnpm exec example"):
+            with self.subTest(command=command):
+                finding = next(
+                    finding
+                    for finding in scan_text(command)
+                    if finding.rule_id == "direct-exec-package-manager"
+                )
+
+                self.assertEqual(finding.severity, Severity.HIGH)
+
     def test_network_in_build_ignores_top_level_sources(self) -> None:
         ids = rule_ids('source=("https://example.com/file.tar.gz")')
 
@@ -569,6 +713,116 @@ class ScannerTests(unittest.TestCase):
         )
 
         self.assertEqual(finding.severity.value, "HIGH")
+
+    def test_diff_runtime_js_dependency_added_is_medium(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=('foo')",
+                "+depends=('foo' 'nodejs')",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "suspicious-runtime-dependency-added"
+        )
+
+        self.assertEqual(finding.severity, Severity.MEDIUM)
+        self.assertEqual(finding.new_value, "nodejs")
+
+    def test_diff_dependency_move_is_not_runtime_addition(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,2 +1,2 @@",
+                "-makedepends=('nodejs')",
+                "+makedepends=()",
+                "-depends=('foo')",
+                "+depends=('foo' 'nodejs')",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertIn("dependency-moved", ids)
+        self.assertNotIn("suspicious-runtime-dependency-added", ids)
+
+    def test_diff_srcinfo_dependency_duplicate_is_deduplicated(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=('foo')",
+                "+depends=('foo' 'bun')",
+                "diff --git a/.SRCINFO b/.SRCINFO",
+                "--- a/.SRCINFO",
+                "+++ b/.SRCINFO",
+                "@@ -1 +1,2 @@",
+                " depends = foo",
+                "+depends = bun",
+            ]
+        )
+        findings = [
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "suspicious-runtime-dependency-added"
+        ]
+
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].filename, "PKGBUILD")
+
+    def test_diff_bun_campaign_variant_reports_composite_findings(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,2 +1,2 @@",
+                "-depends=('pencil')",
+                "+depends=('bun' 'pencil')",
+                "-install=",
+                "+install=pencil-android-lollipop-stencils-git-deps.install",
+                "diff --git a/pencil-android-lollipop-stencils-git-deps.install b/pencil-android-lollipop-stencils-git-deps.install",
+                "--- /dev/null",
+                "+++ b/pencil-android-lollipop-stencils-git-deps.install",
+                "@@ -0,0 +1,4 @@",
+                "+post_install() {{",
+                "+    cd /tmp",
+                "+    bun add lodash js-digest",
+                "+}}",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertIn("install-script-added", ids)
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertIn("temporary-directory-package-install", ids)
+        self.assertIn("suspicious-runtime-dependency-added", ids)
+        self.assertIn("suspicious-live-install-sequence", ids)
+
+    def test_diff_pacman_hook_file_is_detected(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/example.hook b/example.hook",
+                "--- /dev/null",
+                "+++ b/example.hook",
+                "@@ -0,0 +1,2 @@",
+                "+[Action]",
+                "+Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertIn("pacman-hook-added", ids)
+        self.assertIn("pacman-hook-exec", ids)
+        self.assertIn("scriptlet-package-manager", ids)
 
 
 class CliTests(unittest.TestCase):
@@ -1126,6 +1380,76 @@ class UpdateWorkflowTests(unittest.TestCase):
             self.assertTrue(result.has_findings)
             self.assertFalse(cache.has_baseline(update.package))
             self.assertIn("no update diff was reviewed", " ".join(result.reviews[0].notes).lower())
+
+    def test_missing_baseline_scans_hook_files_in_latest_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+
+            def fetcher(_update: AurUpdate, target: Path) -> None:
+                target.mkdir(parents=True)
+                (target / "PKGBUILD").write_text(
+                    "pkgname=example-bin\npkgver=1.1\npkgrel=1\n",
+                    encoding="utf-8",
+                )
+                (target / "example.hook").write_text(
+                    "\n".join(
+                        [
+                            "[Action]",
+                            "Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile'",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            cache = AurCache(Path(temp_dir), fetcher=fetcher)
+
+            result = review_updates([update], cache)
+            ids = {finding.rule_id for finding in result.findings}
+
+            self.assertIn("pacman-hook-exec", ids)
+            self.assertIn("scriptlet-package-manager", ids)
+            self.assertIn("temporary-directory-package-install", ids)
+
+    def test_missing_baseline_scans_install_referenced_custom_script(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+
+            def fetcher(_update: AurUpdate, target: Path) -> None:
+                target.mkdir(parents=True)
+                (target / "PKGBUILD").write_text(
+                    "\n".join(
+                        [
+                            "pkgname=example-bin",
+                            "pkgver=1.1",
+                            "pkgrel=1",
+                            "install=example-deps",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                (target / "example-deps").write_text(
+                    "\n".join(
+                        [
+                            "post_install() {",
+                            "    cd /tmp",
+                            "    npm install atomic-lockfile",
+                            "}",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            cache = AurCache(Path(temp_dir), fetcher=fetcher)
+
+            result = review_updates([update], cache)
+            ids = {finding.rule_id for finding in result.findings}
+
+            self.assertIn("install-script", ids)
+            self.assertIn("scriptlet-package-manager", ids)
+            self.assertIn("temporary-directory-package-install", ids)
 
     def test_missing_baseline_is_reconstructed_from_installed_version_commit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

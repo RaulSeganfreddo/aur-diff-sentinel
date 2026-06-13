@@ -9,10 +9,14 @@ from aur_diff_sentinel.models import Finding, Severity
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 ARRAY_START_RE = re.compile(
-    r"^\s*(source|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
+    r"^\s*(source|depends|makedepends|checkdepends|optdepends|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
     re.IGNORECASE,
 )
 SOURCE_ARRAY_RE = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.IGNORECASE)
+DEPENDENCY_ARRAY_RE = re.compile(
+    r"^(depends|makedepends|checkdepends|optdepends)$",
+    re.IGNORECASE,
+)
 CHECKSUM_ARRAY_RE = re.compile(
     r"^(?P<algorithm>md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?P<suffix>_[a-z0-9_]+)?$",
     re.IGNORECASE,
@@ -28,6 +32,7 @@ CHECKSUM_STRENGTH = {
     "b2": 7,
 }
 VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
+JS_TOOLING_DEPENDENCIES = {"bun", "npm", "nodejs", "yarn", "pnpm"}
 
 
 @dataclass(frozen=True)
@@ -100,11 +105,91 @@ def analyze_source_diff(text: str) -> list[Finding]:
     arrays = _collect_diff_arrays(text)
     findings: list[Finding] = []
 
+    findings.extend(_find_added_metadata_files(text))
     findings.extend(_compare_source_urls(arrays.removed_values, arrays.added_values))
     findings.extend(_find_removed_checksum_arrays(arrays))
     findings.extend(_find_checksum_algorithm_weakening(arrays))
     findings.extend(_find_checksum_count_mismatches(arrays))
     findings.extend(_find_added_checksum_skips(arrays))
+    findings.extend(_find_dependency_changes(arrays))
+    findings.extend(_dedupe_srcinfo_dependency_findings(findings, _find_srcinfo_dependency_changes(text)))
+
+    return findings
+
+
+def _find_added_metadata_files(text: str) -> list[Finding]:
+    findings: list[Finding] = []
+    current_old: str | None = None
+    current_new: str | None = None
+    current_new_file = False
+    shell_file_reported = False
+
+    for raw_line in text.splitlines():
+        if raw_line.startswith("diff --git "):
+            current_old = None
+            current_new = None
+            current_new_file = False
+            shell_file_reported = False
+            continue
+        if raw_line.startswith("---"):
+            current_old = _filename_from_diff_header(raw_line)
+            continue
+        if raw_line.startswith("+++"):
+            current_new = _filename_from_diff_header(raw_line)
+            current_new_file = current_old is None and current_new is not None
+            if current_new_file and current_new is not None:
+                if current_new.endswith(".install"):
+                    findings.append(
+                        _metadata_file_finding(
+                            "install-script-added",
+                            Severity.MEDIUM,
+                            "Install script file added",
+                            "Install scripts can run on the live system during install, upgrade, or removal.",
+                            current_new,
+                        )
+                    )
+                elif current_new.endswith(".hook"):
+                    findings.append(
+                        _metadata_file_finding(
+                            "pacman-hook-added",
+                            Severity.MEDIUM,
+                            "Pacman hook file added",
+                            "Pacman hooks can run automatically during package transactions.",
+                            current_new,
+                        )
+                    )
+            continue
+        if not current_new_file or current_new is None or not raw_line.startswith("+"):
+            continue
+        content = raw_line[1:]
+        if not shell_file_reported and (
+            content.startswith("#!/bin/sh")
+            or content.startswith("#!/usr/bin/sh")
+            or content.startswith("#!/bin/bash")
+            or content.startswith("#!/usr/bin/bash")
+        ):
+            findings.append(
+                _metadata_file_finding(
+                    "aur-metadata-executable-added",
+                    Severity.MEDIUM,
+                    "Executable script file added",
+                    "New executable scripts in AUR metadata should be reviewed before updating.",
+                    current_new,
+                    line_content=content,
+                )
+            )
+            shell_file_reported = True
+        if content.startswith("\x7fELF"):
+            findings.append(
+                _metadata_file_finding(
+                    "aur-metadata-elf-added",
+                    Severity.HIGH,
+                    "ELF file added directly to AUR metadata",
+                    "Compiled binaries committed directly to AUR metadata should be reviewed carefully.",
+                    current_new,
+                    line_content=content,
+                )
+            )
 
     return findings
 
@@ -492,6 +577,159 @@ def _find_added_checksum_skips(arrays: DiffArrays) -> list[Finding]:
     return findings
 
 
+def _find_dependency_changes(arrays: DiffArrays) -> list[Finding]:
+    findings: list[Finding] = []
+    old_dependencies = _dependency_values_by_name(arrays.old_state)
+    new_dependencies = _dependency_values_by_name(arrays.new_state)
+    old_all = {dependency_name(value.value) for values in old_dependencies.values() for value in values}
+    new_all = {dependency_name(value.value) for values in new_dependencies.values() for value in values}
+
+    for value in arrays.added_values:
+        if not _is_dependency(value):
+            continue
+        name = dependency_name(value.value)
+        if name in old_all:
+            if _dependency_group_for(name, old_dependencies) != value.name.lower():
+                findings.append(
+                    _finding(
+                        rule_id="dependency-moved",
+                        severity=Severity.LOW,
+                        message=f"Dependency moved to {value.name}",
+                        hint="Dependency group changes should be checked for packaging intent.",
+                        value=value,
+                        old_value=_dependency_group_for(name, old_dependencies),
+                        new_value=value.name.lower(),
+                    )
+                )
+            continue
+        if name in JS_TOOLING_DEPENDENCIES:
+            findings.append(
+                _finding(
+                    rule_id="suspicious-runtime-dependency-added",
+                    severity=Severity.MEDIUM,
+                    message=f"JavaScript tooling dependency added: {name}",
+                    hint="New JavaScript tooling dependencies can be legitimate, but should be reviewed with install scripts and hooks.",
+                    value=value,
+                    old_value=None,
+                    new_value=name,
+                )
+            )
+
+    for value in arrays.removed_values:
+        if not _is_dependency(value):
+            continue
+        name = dependency_name(value.value)
+        if name in new_all:
+            continue
+        findings.append(
+            _finding(
+                rule_id="dependency-removed",
+                severity=Severity.LOW,
+                message=f"Dependency removed: {name}",
+                hint="Removed dependencies may be normal packaging churn, but can change review context.",
+                value=value,
+                old_value=name,
+                new_value=None,
+            )
+        )
+
+    return findings
+
+
+def _find_srcinfo_dependency_changes(text: str) -> list[Finding]:
+    added: list[DiffValue] = []
+    removed_names: set[str] = set()
+    current_filename: str | None = None
+    old_line_number: int | None = None
+    new_line_number: int | None = None
+
+    for raw_line in text.splitlines():
+        if raw_line.startswith("diff --git "):
+            current_filename = None
+            old_line_number = None
+            new_line_number = None
+            continue
+        if raw_line.startswith("+++"):
+            current_filename = _filename_from_diff_header(raw_line)
+            continue
+        hunk_match = HUNK_HEADER_RE.match(raw_line)
+        if hunk_match:
+            old_line_number = int(hunk_match.group(1))
+            new_line_number = int(hunk_match.group(2))
+            continue
+        if old_line_number is None or new_line_number is None:
+            continue
+        if raw_line.startswith("-") and not raw_line.startswith("---"):
+            value = _srcinfo_dependency_value(raw_line[1:], current_filename)
+            if value is not None:
+                removed_names.add(dependency_name(value.value))
+            old_line_number += 1
+            continue
+        if raw_line.startswith("+") and not raw_line.startswith("+++"):
+            value = _srcinfo_dependency_value(raw_line[1:], current_filename, new_line_number)
+            if value is not None:
+                added.append(value)
+            new_line_number += 1
+            continue
+        old_line_number += 1
+        new_line_number += 1
+
+    findings: list[Finding] = []
+    for value in added:
+        name = dependency_name(value.value)
+        if name in removed_names or name not in JS_TOOLING_DEPENDENCIES:
+            continue
+        findings.append(
+            _finding(
+                rule_id="suspicious-runtime-dependency-added",
+                severity=Severity.MEDIUM,
+                message=f"JavaScript tooling dependency added: {name}",
+                hint="New JavaScript tooling dependencies can be legitimate, but should be reviewed with install scripts and hooks.",
+                value=value,
+                old_value=None,
+                new_value=name,
+            )
+        )
+    return findings
+
+
+def _srcinfo_dependency_value(
+    content: str,
+    filename: str | None,
+    line_number: int = 0,
+) -> DiffValue | None:
+    if filename != ".SRCINFO" and not (filename and filename.endswith("/.SRCINFO")):
+        return None
+    match = re.match(r"^\s*(depends|makedepends|checkdepends|optdepends)\s*=\s*(\S+)", content)
+    if not match:
+        return None
+    return DiffValue(
+        name=match.group(1),
+        value=match.group(2),
+        index=0,
+        line_number=line_number,
+        line_content=content,
+        filename=filename,
+    )
+
+
+def _dedupe_srcinfo_dependency_findings(
+    existing: list[Finding],
+    srcinfo_findings: list[Finding],
+) -> list[Finding]:
+    pkgbuild_dependency_values = {
+        finding.new_value
+        for finding in existing
+        if finding.rule_id == "suspicious-runtime-dependency-added"
+        and (finding.filename == "PKGBUILD" or bool(finding.filename and finding.filename.endswith("/PKGBUILD")))
+    }
+    return [
+        finding
+        for finding in srcinfo_findings
+        if finding.new_value not in pkgbuild_dependency_values
+    ]
+
+
 def _array_finding(
     *,
     rule_id: str,
@@ -544,6 +782,30 @@ def _finding(
     )
 
 
+def _metadata_file_finding(
+    rule_id: str,
+    severity: Severity,
+    message: str,
+    hint: str,
+    filename: str,
+    *,
+    line_content: str | None = None,
+) -> Finding:
+    return Finding(
+        rule_id=rule_id,
+        severity=severity,
+        message=message,
+        line_number=1,
+        line_content=line_content or filename,
+        hint=hint,
+        filename=filename,
+        source_type="diff",
+        target_line_number=1,
+        change_type="added",
+        new_value=filename,
+    )
+
+
 def _filename_from_diff_header(line: str) -> str | None:
     parts = line.split(maxsplit=2)
     if len(parts) < 2:
@@ -567,7 +829,11 @@ def _is_source_url(value: DiffValue) -> bool:
 
 
 def _is_checksum(value: DiffValue) -> bool:
-    return value.name.lower() != "source" and value.value != ""
+    return CHECKSUM_ARRAY_RE.match(value.name) is not None and value.value != ""
+
+
+def _is_dependency(value: DiffValue) -> bool:
+    return DEPENDENCY_ARRAY_RE.match(value.name) is not None and value.value != ""
 
 
 def _is_source_array(array: DiffArray) -> bool:
@@ -592,6 +858,29 @@ def _checksum_arrays_by_suffix(arrays: tuple[DiffArray, ...]) -> dict[str, DiffA
         for array in arrays
         if _is_checksum_array(array)
     }
+
+
+def _dependency_values_by_name(arrays: tuple[DiffArray, ...]) -> dict[str, list[DiffValue]]:
+    dependencies: dict[str, list[DiffValue]] = {}
+    for array in arrays:
+        if not DEPENDENCY_ARRAY_RE.match(array.name):
+            continue
+        dependencies.setdefault(array.name.lower(), []).extend(array.values)
+    return dependencies
+
+
+def _dependency_group_for(
+    dependency: str,
+    dependencies: dict[str, list[DiffValue]],
+) -> str | None:
+    for group, values in dependencies.items():
+        if any(dependency_name(value.value) == dependency for value in values):
+            return group
+    return None
+
+
+def dependency_name(value: str) -> str:
+    return value.split(":", maxsplit=1)[0].split("<", maxsplit=1)[0].split(">", maxsplit=1)[0].split("=", maxsplit=1)[0].strip()
 
 
 def _source_for_checksum_value(
