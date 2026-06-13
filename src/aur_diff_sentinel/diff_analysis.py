@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import re
+import shlex
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import urlparse
 
 from aur_diff_sentinel.models import Finding, Severity
@@ -9,12 +11,12 @@ from aur_diff_sentinel.models import Finding, Severity
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
 ARRAY_START_RE = re.compile(
-    r"^\s*(source|depends|makedepends|checkdepends|optdepends|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
+    r"^\s*(source(?:_[a-z0-9_]+)?|depends(?:_[a-z0-9_]+)?|makedepends(?:_[a-z0-9_]+)?|checkdepends(?:_[a-z0-9_]+)?|optdepends(?:_[a-z0-9_]+)?|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
     re.IGNORECASE,
 )
 SOURCE_ARRAY_RE = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.IGNORECASE)
 DEPENDENCY_ARRAY_RE = re.compile(
-    r"^(depends|makedepends|checkdepends|optdepends)$",
+    r"^(?P<group>depends|makedepends|checkdepends|optdepends)(?P<suffix>_[a-z0-9_]+)?$",
     re.IGNORECASE,
 )
 CHECKSUM_ARRAY_RE = re.compile(
@@ -33,6 +35,7 @@ CHECKSUM_STRENGTH = {
 }
 VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
 JS_TOOLING_DEPENDENCIES = {"bun", "npm", "nodejs", "yarn", "pnpm"}
+ELF_MAGIC = b"\x7fELF"
 
 
 @dataclass(frozen=True)
@@ -113,6 +116,41 @@ def analyze_source_diff(text: str) -> list[Finding]:
     findings.extend(_find_added_checksum_skips(arrays))
     findings.extend(_find_dependency_changes(arrays))
     findings.extend(_dedupe_srcinfo_dependency_findings(findings, _find_srcinfo_dependency_changes(text)))
+
+    return findings
+
+
+def analyze_metadata_tree_changes(old_dir: Path, new_dir: Path) -> list[Finding]:
+    findings: list[Finding] = []
+    if not new_dir.exists():
+        return findings
+
+    for path in sorted(new_dir.rglob("*")):
+        if not path.is_file() or path.is_symlink():
+            continue
+        relative_path = path.relative_to(new_dir)
+        if ".git" in relative_path.parts:
+            continue
+        if (old_dir / relative_path).exists():
+            continue
+        try:
+            with path.open("rb") as file:
+                magic = file.read(len(ELF_MAGIC))
+        except OSError:
+            continue
+        if magic != ELF_MAGIC:
+            continue
+        filename = relative_path.as_posix()
+        findings.append(
+            _metadata_file_finding(
+                "aur-metadata-elf-added",
+                Severity.HIGH,
+                "ELF file added directly to AUR metadata",
+                "Compiled binaries committed directly to AUR metadata should be reviewed carefully.",
+                filename,
+                line_content="<ELF binary>",
+            )
+        )
 
     return findings
 
@@ -370,7 +408,7 @@ def _consume_context_line(
                 filename=filename,
                 start_line_number=line_number,
                 start_line_content=content,
-                lines=[],
+                lines=[(line_number, content)],
             )
             continue
 
@@ -388,11 +426,11 @@ def _consume_context_line(
 def _array_from_block(block: ArrayBlock) -> DiffArray:
     values: list[DiffValue] = []
     for line_number, content in block.lines:
-        for match in QUOTED_VALUE_RE.finditer(content):
+        for token in _array_values_from_line(content):
             values.append(
                 DiffValue(
                     name=block.name,
-                    value=match.group(2),
+                    value=token,
                     index=len(values),
                     line_number=line_number,
                     line_content=content,
@@ -407,6 +445,27 @@ def _array_from_block(block: ArrayBlock) -> DiffArray:
         line_content=block.start_line_content,
         values=tuple(values),
     )
+
+
+def _array_values_from_line(content: str) -> list[str]:
+    value_text = _array_value_text(content)
+    if not value_text:
+        return []
+    try:
+        return shlex.split(value_text, comments=True, posix=True)
+    except ValueError:
+        return [match.group(2) for match in QUOTED_VALUE_RE.finditer(value_text)]
+
+
+def _array_value_text(content: str) -> str:
+    if "=" in content:
+        content = content.split("=", maxsplit=1)[1]
+    content = content.strip()
+    if content.startswith("("):
+        content = content[1:]
+    if ")" in content:
+        content = content.split(")", maxsplit=1)[0]
+    return content.strip()
 
 
 def _compare_source_urls(
@@ -589,7 +648,7 @@ def _find_dependency_changes(arrays: DiffArrays) -> list[Finding]:
             continue
         name = dependency_name(value.value)
         if name in old_all:
-            if _dependency_group_for(name, old_dependencies) != value.name.lower():
+            if _dependency_group_for(name, old_dependencies) != _dependency_group(value.name):
                 findings.append(
                     _finding(
                         rule_id="dependency-moved",
@@ -598,16 +657,16 @@ def _find_dependency_changes(arrays: DiffArrays) -> list[Finding]:
                         hint="Dependency group changes should be checked for packaging intent.",
                         value=value,
                         old_value=_dependency_group_for(name, old_dependencies),
-                        new_value=value.name.lower(),
+                        new_value=_dependency_group(value.name),
                     )
                 )
             continue
         if name in JS_TOOLING_DEPENDENCIES:
             findings.append(
                 _finding(
-                    rule_id="suspicious-runtime-dependency-added",
+                    rule_id="javascript-tooling-dependency-added",
                     severity=Severity.MEDIUM,
-                    message=f"JavaScript tooling dependency added: {name}",
+                    message=f"JavaScript tooling dependency added to {_dependency_group(value.name)}: {name}",
                     hint="New JavaScript tooling dependencies can be legitimate, but should be reviewed with install scripts and hooks.",
                     value=value,
                     old_value=None,
@@ -681,9 +740,9 @@ def _find_srcinfo_dependency_changes(text: str) -> list[Finding]:
             continue
         findings.append(
             _finding(
-                rule_id="suspicious-runtime-dependency-added",
+                rule_id="javascript-tooling-dependency-added",
                 severity=Severity.MEDIUM,
-                message=f"JavaScript tooling dependency added: {name}",
+                message=f"JavaScript tooling dependency added to {_dependency_group(value.name)}: {name}",
                 hint="New JavaScript tooling dependencies can be legitimate, but should be reviewed with install scripts and hooks.",
                 value=value,
                 old_value=None,
@@ -700,7 +759,10 @@ def _srcinfo_dependency_value(
 ) -> DiffValue | None:
     if filename != ".SRCINFO" and not (filename and filename.endswith("/.SRCINFO")):
         return None
-    match = re.match(r"^\s*(depends|makedepends|checkdepends|optdepends)\s*=\s*(\S+)", content)
+    match = re.match(
+        r"^\s*(depends(?:_[a-z0-9_]+)?|makedepends(?:_[a-z0-9_]+)?|checkdepends(?:_[a-z0-9_]+)?|optdepends(?:_[a-z0-9_]+)?)\s*=\s*(\S+)",
+        content,
+    )
     if not match:
         return None
     return DiffValue(
@@ -720,7 +782,7 @@ def _dedupe_srcinfo_dependency_findings(
     pkgbuild_dependency_values = {
         finding.new_value
         for finding in existing
-        if finding.rule_id == "suspicious-runtime-dependency-added"
+        if finding.rule_id == "javascript-tooling-dependency-added"
         and (finding.filename == "PKGBUILD" or bool(finding.filename and finding.filename.endswith("/PKGBUILD")))
     }
     return [
@@ -865,7 +927,7 @@ def _dependency_values_by_name(arrays: tuple[DiffArray, ...]) -> dict[str, list[
     for array in arrays:
         if not DEPENDENCY_ARRAY_RE.match(array.name):
             continue
-        dependencies.setdefault(array.name.lower(), []).extend(array.values)
+        dependencies.setdefault(_dependency_group(array.name), []).extend(array.values)
     return dependencies
 
 
@@ -881,6 +943,13 @@ def _dependency_group_for(
 
 def dependency_name(value: str) -> str:
     return value.split(":", maxsplit=1)[0].split("<", maxsplit=1)[0].split(">", maxsplit=1)[0].split("=", maxsplit=1)[0].strip()
+
+
+def _dependency_group(name: str) -> str:
+    match = DEPENDENCY_ARRAY_RE.match(name)
+    if match:
+        return match.group("group").lower()
+    return name.lower()
 
 
 def _source_for_checksum_value(

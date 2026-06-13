@@ -22,7 +22,7 @@ REASON_PHRASES = {
     "scriptlet-package-manager": "package manager in live script",
     "temporary-directory-package-install": "package install from temporary directory",
     "direct-exec-package-manager": "package manager direct execution",
-    "suspicious-runtime-dependency-added": "JavaScript tooling dependency added",
+    "javascript-tooling-dependency-added": "JavaScript tooling dependency added",
     "dependency-moved": "dependency moved",
     "dependency-removed": "dependency removed",
     "aur-metadata-executable-added": "executable metadata file added",

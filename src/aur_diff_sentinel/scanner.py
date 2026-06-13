@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Sequence
 
 from aur_diff_sentinel.diff_analysis import analyze_source_diff
 from aur_diff_sentinel.models import Finding, Rule, Severity, SourceLine
 from aur_diff_sentinel.pkgbuild_analysis import analyze_pkgbuild_checksums
 from aur_diff_sentinel.rules import RULES
+from aur_diff_sentinel.rules import changes_to_non_temp_dir as _changes_to_non_temp_dir
 from aur_diff_sentinel.rules import changes_to_temp_dir as _changes_to_temp_dir
 from aur_diff_sentinel.rules import uses_js_package_manager as _uses_js_package_manager
 
@@ -37,8 +38,14 @@ def _brace_delta(content: str) -> int:
 
 
 class FunctionContextTracker:
-    def __init__(self, filename: str | None = None) -> None:
+    def __init__(
+        self,
+        filename: str | None = None,
+        *,
+        scriptlet_files: Collection[str] | None = None,
+    ) -> None:
         self.filename = filename
+        self.scriptlet_files = set(scriptlet_files or ())
         self.function_name: str | None = None
         self.brace_depth = 0
 
@@ -56,7 +63,7 @@ class FunctionContextTracker:
             function_match = FUNCTION_START_RE.match(content)
             if function_match:
                 self.function_name = function_match.group(1)
-                self.brace_depth = max(1, _brace_delta(content))
+                self.brace_depth = _brace_delta(content)
 
         function_name = self.function_name
 
@@ -72,15 +79,20 @@ class FunctionContextTracker:
     def _execution_context(self, function_name: str | None) -> str | None:
         if _is_hook_filename(self.filename):
             return "hook"
-        if function_name in SCRIPTLET_FUNCTIONS:
+        if function_name in SCRIPTLET_FUNCTIONS or _is_scriptlet_filename(self.filename, self.scriptlet_files):
             return "scriptlet"
         if function_name in BUILD_FUNCTIONS:
             return "build"
         return None
 
 
-def source_lines_from_text(text: str, filename: str | None = None) -> list[SourceLine]:
-    tracker = FunctionContextTracker(filename)
+def source_lines_from_text(
+    text: str,
+    filename: str | None = None,
+    *,
+    scriptlet_files: Collection[str] | None = None,
+) -> list[SourceLine]:
+    tracker = FunctionContextTracker(filename, scriptlet_files=scriptlet_files)
     lines: list[SourceLine] = []
 
     for index, line in enumerate(text.splitlines(), start=1):
@@ -112,17 +124,22 @@ def _filename_from_diff_header(line: str) -> str | None:
     return path
 
 
-def source_lines_from_diff(text: str, filename: str | None = None) -> list[SourceLine]:
+def source_lines_from_diff(
+    text: str,
+    filename: str | None = None,
+    *,
+    scriptlet_files: Collection[str] | None = None,
+) -> list[SourceLine]:
     lines: list[SourceLine] = []
     current_filename = filename
     target_line_number: int | None = None
-    tracker = FunctionContextTracker(filename)
+    tracker = FunctionContextTracker(filename, scriptlet_files=scriptlet_files)
 
     for index, line in enumerate(text.splitlines(), start=1):
         if line.startswith("diff --git "):
             current_filename = filename
             target_line_number = None
-            tracker = FunctionContextTracker(filename)
+            tracker = FunctionContextTracker(filename, scriptlet_files=scriptlet_files)
             continue
 
         if line.startswith("+++"):
@@ -133,7 +150,7 @@ def source_lines_from_diff(text: str, filename: str | None = None) -> list[Sourc
         hunk_match = HUNK_HEADER_RE.match(line)
         if hunk_match:
             target_line_number = int(hunk_match.group(1))
-            tracker = FunctionContextTracker(current_filename)
+            tracker = FunctionContextTracker(current_filename, scriptlet_files=scriptlet_files)
             continue
 
         if target_line_number is None:
@@ -207,8 +224,10 @@ def scan_text(
     text: str,
     rules: Sequence[Rule] = RULES,
     filename: str | None = None,
+    *,
+    scriptlet_files: Collection[str] | None = None,
 ) -> list[Finding]:
-    lines = source_lines_from_text(text, filename=filename)
+    lines = source_lines_from_text(text, filename=filename, scriptlet_files=scriptlet_files)
     findings = scan_lines(lines, rules=rules)
     if rules is RULES:
         findings.extend(_sequence_findings(lines))
@@ -229,8 +248,10 @@ def scan_diff_text(
     text: str,
     rules: Sequence[Rule] = RULES,
     filename: str | None = None,
+    *,
+    scriptlet_files: Collection[str] | None = None,
 ) -> list[Finding]:
-    lines = source_lines_from_diff(text, filename=filename)
+    lines = source_lines_from_diff(text, filename=filename, scriptlet_files=scriptlet_files)
     line_findings = scan_lines(lines, rules=rules)
     if rules is RULES:
         line_findings.extend(_sequence_findings(lines))
@@ -258,21 +279,30 @@ def _is_hook_filename(filename: str | None) -> bool:
     return bool(filename and filename.endswith(".hook"))
 
 
+def _is_scriptlet_filename(filename: str | None, scriptlet_files: Collection[str]) -> bool:
+    if not filename:
+        return False
+    return filename.endswith(".install") or filename in scriptlet_files or filename.rsplit("/", maxsplit=1)[-1] in scriptlet_files
+
+
 def _sequence_findings(lines: list[SourceLine]) -> list[Finding]:
     findings: list[Finding] = []
-    temp_dir_by_block: dict[tuple[str | None, str | None, str | None], SourceLine] = {}
-    seen_temp_package_install: set[tuple[str | None, str | None, str | None]] = set()
+    working_directory_by_block: dict[tuple[str | None, str | None, str | None, int | None], str] = {}
+    seen_temp_package_install: set[tuple[str | None, str | None, str | None, int | None]] = set()
 
     for line in lines:
         if _is_full_line_comment(line.content):
             continue
-        block_key = (line.filename, line.function_name, line.execution_context)
+        block_key = _sequence_block_key(line)
+        same_line_temp_dir = _changes_to_temp_dir(line.content)
         if line.execution_context in {"scriptlet", "hook"} and _changes_to_temp_dir(line.content):
-            temp_dir_by_block[block_key] = line
+            working_directory_by_block[block_key] = "temporary"
+        elif line.execution_context in {"scriptlet", "hook"} and _changes_to_non_temp_dir(line.content):
+            working_directory_by_block[block_key] = "non-temporary"
         if (
             line.execution_context in {"scriptlet", "hook"}
             and _uses_js_package_manager(line.content)
-            and (block_key in temp_dir_by_block or _changes_to_temp_dir(line.content))
+            and (working_directory_by_block.get(block_key) == "temporary" or same_line_temp_dir)
             and block_key not in seen_temp_package_install
         ):
             findings.append(
@@ -300,6 +330,16 @@ def _sequence_findings(lines: list[SourceLine]) -> list[Finding]:
     return findings
 
 
+def _sequence_block_key(line: SourceLine) -> tuple[str | None, str | None, str | None, int | None]:
+    if line.execution_context == "hook" and _is_hook_exec(line.content):
+        return (line.filename, line.function_name, line.execution_context, line.line_number)
+    return (line.filename, line.function_name, line.execution_context, None)
+
+
+def _is_hook_exec(content: str) -> bool:
+    return re.match(r"^\s*Exec\s*=", content, re.IGNORECASE) is not None
+
+
 def _with_composite_findings(findings: list[Finding]) -> list[Finding]:
     ids = {finding.rule_id for finding in findings}
     has_script_entry = bool(
@@ -312,7 +352,7 @@ def _with_composite_findings(findings: list[Finding]) -> list[Finding]:
         }
     )
     if not (
-        "suspicious-runtime-dependency-added" in ids
+        "javascript-tooling-dependency-added" in ids
         and has_script_entry
         and "scriptlet-package-manager" in ids
         and "temporary-directory-package-install" in ids

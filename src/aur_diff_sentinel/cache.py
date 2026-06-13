@@ -229,9 +229,11 @@ def unified_diff_dirs(old_dir: Path, new_dir: Path) -> str:
     for relative_path in sorted(_relative_metadata_paths(old_dir) | _relative_metadata_paths(new_dir)):
         old_path = old_dir / relative_path
         new_path = new_dir / relative_path
+        old_exists = old_path.exists()
+        new_exists = new_path.exists()
         old_text = _read_text_or_empty(old_path)
         new_text = _read_text_or_empty(new_path)
-        if old_text == new_text:
+        if old_exists == new_exists and old_text == new_text:
             continue
 
         old_lines = old_text.splitlines(keepends=True)
@@ -240,8 +242,8 @@ def unified_diff_dirs(old_dir: Path, new_dir: Path) -> str:
             difflib.unified_diff(
                 old_lines,
                 new_lines,
-                fromfile=f"a/{relative_path.as_posix()}",
-                tofile=f"b/{relative_path.as_posix()}",
+                fromfile=f"a/{relative_path.as_posix()}" if old_exists else "/dev/null",
+                tofile=f"b/{relative_path.as_posix()}" if new_exists else "/dev/null",
                 lineterm="",
             )
         )

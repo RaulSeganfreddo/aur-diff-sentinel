@@ -89,6 +89,7 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - privilege or live-system commands
 - `.install` script references
 - new install script and pacman hook files
+- ELF files added directly to AUR metadata
 - `sh -c` / `bash -c`
 - shell `source` commands
 - decoded content piped into shells
@@ -96,7 +97,7 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - network activity inside build functions
 - package manager commands in install scripts and pacman hooks
 - package manager commands run from temporary directories in live-system contexts
-- JavaScript tooling dependencies added in update diffs
+- JavaScript tooling dependencies added to dependency groups in update diffs
 - combined live-system install sequences made from multiple review signals
 - obvious writes outside `$pkgdir`
 - newly added source URLs in diffs

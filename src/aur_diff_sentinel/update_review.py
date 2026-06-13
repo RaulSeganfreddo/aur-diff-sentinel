@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Callable
 
 from aur_diff_sentinel.cache import AurCache
+from aur_diff_sentinel.diff_analysis import analyze_metadata_tree_changes
 from aur_diff_sentinel.models import Finding
 from aur_diff_sentinel.provider import AurUpdate, installed_version
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
@@ -86,7 +87,13 @@ def review_updates(
 
         if review.baseline_available:
             diff_text = cache.diff_baseline_to_latest(update.package, latest_dir)
-            review.findings = scan_diff_text(diff_text) if diff_text else []
+            install_references = _install_references(latest_dir)
+            review.findings = _dedupe_findings(
+                [
+                    *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
+                    *analyze_metadata_tree_changes(cache.baseline_dir(update.package), latest_dir),
+                ]
+            )
         else:
             review.findings = _scan_latest_metadata(latest_dir)
 
@@ -199,7 +206,13 @@ def _refresh_candidate(
         return review
 
     diff_text = cache.diff_baseline_to_latest(update.package, candidate.latest_dir)
-    review.findings = scan_diff_text(diff_text) if diff_text else []
+    install_references = _install_references(candidate.latest_dir)
+    review.findings = _dedupe_findings(
+        [
+            *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
+            *analyze_metadata_tree_changes(cache.baseline_dir(update.package), candidate.latest_dir),
+        ]
+    )
     if review.findings and not force:
         review.refresh_blocked = True
         review.notes.append("Review baseline was not refreshed.")
@@ -215,13 +228,21 @@ def _refresh_candidate(
 
 def _scan_latest_metadata(latest_dir: Path) -> list[Finding]:
     findings: list[Finding] = []
+    install_references = _install_references(latest_dir)
     for path in _metadata_scan_paths(latest_dir):
         try:
             text = path.read_text(encoding="utf-8")
         except UnicodeDecodeError:
             continue
-        findings.extend(scan_text(text, filename=path.relative_to(latest_dir).as_posix()))
-    return findings
+        findings.extend(
+            scan_text(
+                text,
+                filename=path.relative_to(latest_dir).as_posix(),
+                scriptlet_files=install_references,
+            )
+        )
+    findings.extend(analyze_metadata_tree_changes(latest_dir / ".aur-sentinel-empty-baseline", latest_dir))
+    return _dedupe_findings(findings)
 
 
 def _metadata_scan_paths(latest_dir: Path) -> list[Path]:
@@ -265,3 +286,21 @@ def _is_scannable_metadata_path(root: Path, path: Path) -> bool:
         return path.stat().st_size <= MAX_METADATA_SCAN_BYTES
     except OSError:
         return False
+
+
+def _dedupe_findings(findings: list[Finding]) -> list[Finding]:
+    deduped: list[Finding] = []
+    seen: set[tuple[str, str | None, int, str | None, str | None]] = set()
+    for finding in findings:
+        key = (
+            finding.rule_id,
+            finding.filename,
+            finding.line_number,
+            finding.old_value,
+            finding.new_value,
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(finding)
+    return deduped

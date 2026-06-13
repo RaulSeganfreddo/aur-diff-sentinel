@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
-from aur_diff_sentinel.cache import AurCache, metadata_version
+from aur_diff_sentinel.cache import AurCache, metadata_version, unified_diff_dirs
 from aur_diff_sentinel.cli import run
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import (
@@ -340,6 +340,123 @@ class ScannerTests(unittest.TestCase):
         )
 
         self.assertEqual(findings, [])
+
+    def test_quoted_assignment_inside_scriptlet_does_not_match_package_manager_rules(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "post_install() {",
+                    '    message="run bun add manually"',
+                    "}",
+                ]
+            ),
+            filename="example.install",
+        )
+
+        self.assertNotIn("scriptlet-package-manager", {finding.rule_id for finding in findings})
+
+    def test_install_file_hunk_without_function_signature_still_uses_scriptlet_context(self) -> None:
+        text = "\n".join(
+            [
+                "--- a/example.install",
+                "+++ b/example.install",
+                "@@ -40,4 +40,5 @@",
+                "     existing_command",
+                "+    npm install suspicious-package",
+                " }",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "scriptlet-package-manager"
+        )
+
+        self.assertIsNone(finding.function_name)
+        self.assertEqual(finding.execution_context, "scriptlet")
+
+    def test_custom_install_reference_hunk_uses_scriptlet_context(self) -> None:
+        text = "\n".join(
+            [
+                "--- a/example-deps",
+                "+++ b/example-deps",
+                "@@ -1 +1 @@",
+                "+npm install suspicious-package",
+            ]
+        )
+        ids = {
+            finding.rule_id
+            for finding in scan_diff_text(text, scriptlet_files={"example-deps"})
+        }
+
+        self.assertIn("scriptlet-package-manager", ids)
+
+    def test_one_line_scriptlet_does_not_leak_function_name_to_following_lines(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    'post_install() { echo "done"; }',
+                    "npm install suspicious-package",
+                ]
+            ),
+            filename="example.install",
+        )
+        package_manager_findings = [
+            finding for finding in findings if finding.rule_id == "scriptlet-package-manager"
+        ]
+
+        self.assertEqual(len(package_manager_findings), 1)
+        self.assertIsNone(package_manager_findings[0].function_name)
+        self.assertEqual(package_manager_findings[0].execution_context, "scriptlet")
+
+    def test_hook_shell_payload_package_manager_at_start_is_detected(self) -> None:
+        for line in (
+            "Exec = /bin/sh -c 'npm install package'",
+            'Exec=/usr/bin/bash -c "bun add package"',
+        ):
+            with self.subTest(line=line):
+                ids = {
+                    finding.rule_id
+                    for finding in scan_text(line, filename="example.hook")
+                }
+
+                self.assertIn("pacman-hook-exec", ids)
+                self.assertIn("scriptlet-package-manager", ids)
+
+    def test_temp_directory_state_is_cleared_by_later_cd(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "post_install() {",
+                    "    cd /tmp",
+                    "    prepare_something",
+                    "    cd /usr/share/example",
+                    "    npm install package",
+                    "}",
+                ]
+            ),
+            filename="example.install",
+        )
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertNotIn("temporary-directory-package-install", ids)
+
+    def test_hook_temp_directory_state_does_not_cross_exec_lines(self) -> None:
+        findings = scan_text(
+            "\n".join(
+                [
+                    "[Action]",
+                    "Exec = /bin/sh -c 'cd /tmp'",
+                    "Exec = /bin/sh -c 'npm install package'",
+                ]
+            ),
+            filename="example.hook",
+        )
+        ids = {finding.rule_id for finding in findings}
+
+        self.assertIn("scriptlet-package-manager", ids)
+        self.assertNotIn("temporary-directory-package-install", ids)
 
     def test_absolute_env_and_command_package_manager_forms_are_detected(self) -> None:
         ids = {
@@ -714,7 +831,7 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual(finding.severity.value, "HIGH")
 
-    def test_diff_runtime_js_dependency_added_is_medium(self) -> None:
+    def test_diff_javascript_tooling_dependency_added_is_medium(self) -> None:
         text = "\n".join(
             [
                 "diff --git a/PKGBUILD b/PKGBUILD",
@@ -728,11 +845,82 @@ class ScannerTests(unittest.TestCase):
         finding = next(
             finding
             for finding in scan_diff_text(text)
-            if finding.rule_id == "suspicious-runtime-dependency-added"
+            if finding.rule_id == "javascript-tooling-dependency-added"
         )
 
         self.assertEqual(finding.severity, Severity.MEDIUM)
         self.assertEqual(finding.new_value, "nodejs")
+
+    def test_diff_unquoted_javascript_tooling_dependency_added_is_detected(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bun)",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "javascript-tooling-dependency-added"
+        )
+
+        self.assertEqual(finding.new_value, "bun")
+
+    def test_diff_multiline_unquoted_javascript_tooling_dependency_added_is_detected(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,4 +1,5 @@",
+                " depends=(",
+                "     foo",
+                "+    bun",
+                " )",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertIn("javascript-tooling-dependency-added", ids)
+
+    def test_diff_arch_specific_javascript_tooling_dependency_added_is_detected(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-makedepends_x86_64=(foo)",
+                "+makedepends_x86_64=(foo nodejs)",
+            ]
+        )
+        finding = next(
+            finding
+            for finding in scan_diff_text(text)
+            if finding.rule_id == "javascript-tooling-dependency-added"
+        )
+
+        self.assertEqual(finding.new_value, "nodejs")
+        self.assertIn("makedepends", finding.message)
+
+    def test_diff_generic_dependency_added_is_not_reported(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+            ]
+        )
+        ids = {finding.rule_id for finding in scan_diff_text(text)}
+
+        self.assertNotIn("javascript-tooling-dependency-added", ids)
 
     def test_diff_dependency_move_is_not_runtime_addition(self) -> None:
         text = "\n".join(
@@ -750,7 +938,7 @@ class ScannerTests(unittest.TestCase):
         ids = {finding.rule_id for finding in scan_diff_text(text)}
 
         self.assertIn("dependency-moved", ids)
-        self.assertNotIn("suspicious-runtime-dependency-added", ids)
+        self.assertNotIn("javascript-tooling-dependency-added", ids)
 
     def test_diff_srcinfo_dependency_duplicate_is_deduplicated(self) -> None:
         text = "\n".join(
@@ -772,7 +960,7 @@ class ScannerTests(unittest.TestCase):
         findings = [
             finding
             for finding in scan_diff_text(text)
-            if finding.rule_id == "suspicious-runtime-dependency-added"
+            if finding.rule_id == "javascript-tooling-dependency-added"
         ]
 
         self.assertEqual(len(findings), 1)
@@ -804,7 +992,7 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("install-script-added", ids)
         self.assertIn("scriptlet-package-manager", ids)
         self.assertIn("temporary-directory-package-install", ids)
-        self.assertIn("suspicious-runtime-dependency-added", ids)
+        self.assertIn("javascript-tooling-dependency-added", ids)
         self.assertIn("suspicious-live-install-sequence", ids)
 
     def test_diff_pacman_hook_file_is_detected(self) -> None:
@@ -1367,6 +1555,158 @@ class UpdateWorkflowTests(unittest.TestCase):
             self.assertFalse(result.reviews[0].baseline_refreshed)
             self.assertIn("pkgver=1.0", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
 
+    def test_cache_diff_uses_dev_null_for_added_metadata_files(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old_dir = root / "old"
+            new_dir = root / "new"
+            old_dir.mkdir()
+            new_dir.mkdir()
+            (new_dir / "example.install").write_text(
+                "post_install() {\n    echo done\n}\n",
+                encoding="utf-8",
+            )
+
+            diff_text = unified_diff_dirs(old_dir, new_dir)
+
+            self.assertIn("--- /dev/null", diff_text)
+            self.assertIn("+++ b/example.install", diff_text)
+            self.assertIn("install-script-added", {finding.rule_id for finding in scan_diff_text(diff_text)})
+
+    def test_cache_diff_added_hook_file_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old_dir = root / "old"
+            new_dir = root / "new"
+            old_dir.mkdir()
+            new_dir.mkdir()
+            (new_dir / "example.hook").write_text(
+                "[Action]\nExec = /bin/sh -c 'npm install package'\n",
+                encoding="utf-8",
+            )
+
+            ids = {finding.rule_id for finding in scan_diff_text(unified_diff_dirs(old_dir, new_dir))}
+
+            self.assertIn("pacman-hook-added", ids)
+            self.assertIn("scriptlet-package-manager", ids)
+
+    def test_cache_diff_added_shell_script_file_is_detected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old_dir = root / "old"
+            new_dir = root / "new"
+            old_dir.mkdir()
+            new_dir.mkdir()
+            (new_dir / "helper").write_text("#!/bin/sh\necho done\n", encoding="utf-8")
+
+            ids = {finding.rule_id for finding in scan_diff_text(unified_diff_dirs(old_dir, new_dir))}
+
+            self.assertIn("aur-metadata-executable-added", ids)
+
+    def test_updates_detects_added_elf_metadata_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root)
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\n",
+                encoding="utf-8",
+            )
+            (baseline / ".aur-sentinel-baseline-version").write_text("1.0-1", encoding="utf-8")
+
+            def fetcher(_update: AurUpdate, target: Path) -> None:
+                target.mkdir(parents=True)
+                (target / "PKGBUILD").write_text(
+                    "pkgname=example-bin\npkgver=1.1\npkgrel=1\n",
+                    encoding="utf-8",
+                )
+                (target / "payload").write_bytes(b"\x7fELF\xff\x00")
+
+            cache.fetcher = fetcher
+
+            result = review_updates([update], cache)
+
+            self.assertIn("aur-metadata-elf-added", {finding.rule_id for finding in result.findings})
+
+    def test_updates_review_path_reports_bun_install_sequence_and_keeps_baseline(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root)
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "\n".join(
+                    [
+                        "pkgname=example-bin",
+                        "pkgver=1.0",
+                        "pkgrel=1",
+                        "depends=(pencil)",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            (baseline / ".aur-sentinel-baseline-version").write_text("1.0-1", encoding="utf-8")
+
+            def fetcher(_update: AurUpdate, target: Path) -> None:
+                target.mkdir(parents=True)
+                (target / "PKGBUILD").write_text(
+                    "\n".join(
+                        [
+                            "pkgname=example-bin",
+                            "pkgver=1.1",
+                            "pkgrel=1",
+                            "depends=(pencil bun)",
+                            "install=example-deps.install",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                (target / ".SRCINFO").write_text(
+                    "\n".join(
+                        [
+                            "pkgbase = example-bin",
+                            "\tdepends = pencil",
+                            "\tdepends = bun",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+                (target / "example-deps.install").write_text(
+                    "\n".join(
+                        [
+                            "post_install() {",
+                            "    cd /tmp",
+                            "    bun add lodash js-digest",
+                            "}",
+                            "",
+                        ]
+                    ),
+                    encoding="utf-8",
+                )
+
+            cache.fetcher = fetcher
+
+            result = review_updates([update], cache)
+            ids = {finding.rule_id for finding in result.findings}
+            report = format_update_review(result)
+
+            self.assertIn("install-script", ids)
+            self.assertIn("install-script-added", ids)
+            self.assertIn("javascript-tooling-dependency-added", ids)
+            self.assertIn("scriptlet-package-manager", ids)
+            self.assertIn("temporary-directory-package-install", ids)
+            self.assertIn("suspicious-live-install-sequence", ids)
+            self.assertIn("High attention:", report)
+            self.assertIn("example-bin", report)
+            self.assertFalse(result.reviews[0].baseline_refreshed)
+            self.assertIn("pkgver=1.0", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
+
     def test_missing_baseline_scans_latest_without_initializing_to_latest(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             update = AurUpdate("example-bin", "1.0-1", "1.1-1")
@@ -1792,6 +2132,32 @@ class UpdatesCliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("no helper", stderr)
+
+    def test_updates_with_findings_returns_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+            cache = AurCache(root, fetcher=_fixture_fetcher("1.1", "1", "sha256sums=('SKIP')"))
+            baseline = cache.baseline_dir(update.package)
+            baseline.mkdir(parents=True)
+            (baseline / "PKGBUILD").write_text(
+                "pkgname=example-bin\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+            (baseline / ".aur-sentinel-baseline-version").write_text("1.0-1", encoding="utf-8")
+
+            with (
+                patch("aur_diff_sentinel.cli.discover_updates", return_value=[update]),
+                patch("aur_diff_sentinel.cli.AurCache", return_value=cache),
+            ):
+                exit_code, stdout, stderr = self.run_cli(["updates", "--cache-dir", str(root)])
+
+            self.assertEqual(exit_code, 1)
+            self.assertEqual(stderr, "")
+            self.assertIn("High attention:", stdout)
+            self.assertIn("checksum-skip-added", stdout)
+            self.assertIn("No packages were updated.", stdout)
+            self.assertIn("pkgver=1.0", (baseline / "PKGBUILD").read_text(encoding="utf-8"))
 
     def test_baseline_refresh_blocked_message_mentions_force(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

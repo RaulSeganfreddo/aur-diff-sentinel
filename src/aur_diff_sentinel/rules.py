@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 import shlex
 
@@ -10,47 +11,15 @@ BUILD_FUNCTIONS = {"prepare", "build", "check", "package"}
 SCRIPTLET_CONTEXTS = {"scriptlet", "hook"}
 SENSITIVE_PATH_PREFIXES = ("/usr", "/etc", "/var", "/home", "/root")
 
-COMMAND_PREFIX = (
-    r"(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*"
-    r"(?:(?:/usr/bin/|/bin/)?(?:env|command)\s+)*"
-    r"(?:/usr/bin/|/bin/)?"
-)
-COMMAND_BOUNDARY = r"(?:^\s*|[;&|]\s*)"
-JS_PACKAGE_MANAGER_COMMAND_RE = re.compile(
-    COMMAND_BOUNDARY
-    + COMMAND_PREFIX
-    + r"(?:"
-    r"npm\s+(?:install|add|ci)(?:\s|$)|"
-    r"npx(?:\s|$)|"
-    r"bun\s+(?:add|install)(?:\s|$)|"
-    r"bunx(?:\s|$)|"
-    r"yarn(?:\s+(?:add|install))?(?:\s|$)|"
-    r"pnpm\s+(?:add|install|exec)(?:\s|$)"
-    r")",
-    re.IGNORECASE,
-)
-DIRECT_EXEC_PACKAGE_MANAGER_RE = re.compile(
-    COMMAND_BOUNDARY + COMMAND_PREFIX + r"(?:npx|bunx|pnpm\s+exec)(?:\s|$)",
-    re.IGNORECASE,
-)
-TEMP_DIR_RE = re.compile(
-    r"(?:^\s*|[;&|]\s*|(?:/usr/bin/|/bin/)?(?:ba)?sh\s+-c\s*['\"]\s*)"
-    r"cd\s+['\"]?(?:/tmp|/var/tmp)(?:/|['\"\s;&|]|$)",
-    re.IGNORECASE,
-)
+ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 HOOK_EXEC_RE = re.compile(r"^\s*Exec\s*=", re.IGNORECASE)
+EXEC_VALUE_RE = re.compile(r"^\s*Exec\s*=\s*(.*)$", re.IGNORECASE)
 
 NETWORK_IN_BUILD_RE = re.compile(
     r"(^\s*|[;&|]\s*)("
     r"curl(\s|$)|"
     r"wget(\s|$)|"
     r"git\s+clone(\s|$)|"
-    r"(?:/usr/bin/)?npm\s+(install|add|ci)(\s|$)|"
-    r"(?:/usr/bin/)?npx(\s|$)|"
-    r"(?:/usr/bin/)?bun\s+(add|install)(\s|$)|"
-    r"(?:/usr/bin/)?bunx(\s|$)|"
-    r"(?:/usr/bin/)?yarn(\s+(add|install))?(\s|$)|"
-    r"(?:/usr/bin/)?pnpm\s+(add|install|exec)(\s|$)|"
     r"pip[0-9.]*\s+install(\s|$)|"
     r"go\s+get(\s|$)|"
     r"cargo\s+install(\s|$)"
@@ -70,16 +39,20 @@ def _is_build_function(line: SourceLine) -> bool:
 def _network_in_build(line: SourceLine) -> bool:
     return _is_build_function(line) and (
         NETWORK_IN_BUILD_RE.search(line.content) is not None
-        or JS_PACKAGE_MANAGER_COMMAND_RE.search(line.content) is not None
+        or uses_js_package_manager(line.content)
     )
 
 
 def uses_js_package_manager(content: str) -> bool:
-    return JS_PACKAGE_MANAGER_COMMAND_RE.search(content) is not None
+    return any(_is_js_package_manager_command(tokens) for tokens in _shell_commands(content))
 
 
 def changes_to_temp_dir(content: str) -> bool:
-    return TEMP_DIR_RE.search(content) is not None
+    return any(_is_cd_to_temp_dir(tokens) for tokens in _shell_commands(content))
+
+
+def changes_to_non_temp_dir(content: str) -> bool:
+    return any(_is_cd_to_non_temp_dir(tokens) for tokens in _shell_commands(content))
 
 
 def _scriptlet_package_manager(line: SourceLine) -> bool:
@@ -87,11 +60,162 @@ def _scriptlet_package_manager(line: SourceLine) -> bool:
 
 
 def _direct_exec_package_manager(line: SourceLine) -> bool:
-    return DIRECT_EXEC_PACKAGE_MANAGER_RE.search(line.content) is not None
+    return any(_is_direct_exec_package_manager(tokens) for tokens in _shell_commands(line.content))
 
 
 def _pacman_hook_exec(line: SourceLine) -> bool:
     return line.execution_context == "hook" and HOOK_EXEC_RE.match(line.content) is not None
+
+
+def _shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
+    if depth > 2:
+        return []
+
+    content = _exec_value(content)
+    commands: list[list[str]] = []
+    for segment in _split_shell_segments(content):
+        tokens = _tokens(segment)
+        tokens = _strip_command_prefix(tokens)
+        if not tokens:
+            continue
+        shell_payload = _shell_c_payload(tokens)
+        if shell_payload is not None:
+            commands.extend(_shell_commands(shell_payload, depth=depth + 1))
+            continue
+        commands.append(tokens)
+    return commands
+
+
+def _exec_value(content: str) -> str:
+    match = EXEC_VALUE_RE.match(content)
+    if match:
+        return match.group(1)
+    return content
+
+
+def _split_shell_segments(content: str) -> list[str]:
+    segments: list[str] = []
+    current: list[str] = []
+    quote: str | None = None
+    escape = False
+    index = 0
+
+    while index < len(content):
+        char = content[index]
+        if escape:
+            current.append(char)
+            escape = False
+            index += 1
+            continue
+        if char == "\\":
+            current.append(char)
+            escape = True
+            index += 1
+            continue
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            current.append(char)
+            quote = char
+            index += 1
+            continue
+        if content.startswith("&&", index) or content.startswith("||", index):
+            _append_segment(segments, current)
+            current = []
+            index += 2
+            continue
+        if char in {";", "|"}:
+            _append_segment(segments, current)
+            current = []
+            index += 1
+            continue
+        current.append(char)
+        index += 1
+
+    _append_segment(segments, current)
+    return segments
+
+
+def _append_segment(segments: list[str], chars: list[str]) -> None:
+    segment = "".join(chars).strip()
+    if segment:
+        segments.append(segment)
+
+
+def _strip_command_prefix(tokens: list[str]) -> list[str]:
+    index = 0
+    while index < len(tokens) and ASSIGNMENT_RE.match(tokens[index]):
+        index += 1
+    while index < len(tokens) and _command_name(tokens[index]) in {"env", "command"}:
+        index += 1
+    return tokens[index:]
+
+
+def _shell_c_payload(tokens: list[str]) -> str | None:
+    if _command_name(tokens[0]) not in {"sh", "bash"}:
+        return None
+    index = 1
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "-c":
+            if index + 1 < len(tokens):
+                return tokens[index + 1]
+            return None
+        if token.startswith("-") and "c" in token[1:]:
+            if index + 1 < len(tokens):
+                return tokens[index + 1]
+            return None
+        index += 1
+    return None
+
+
+def _command_name(token: str) -> str:
+    return os.path.basename(token).lower()
+
+
+def _is_js_package_manager_command(tokens: list[str]) -> bool:
+    command = _command_name(tokens[0])
+    args = [token.lower() for token in tokens[1:]]
+    if command == "npm":
+        return bool(args) and args[0] in {"install", "add", "ci"}
+    if command == "npx":
+        return True
+    if command == "bun":
+        return bool(args) and args[0] in {"add", "install"}
+    if command == "bunx":
+        return True
+    if command == "yarn":
+        return not args or args[0] in {"add", "install"}
+    if command == "pnpm":
+        return bool(args) and args[0] in {"add", "install", "exec"}
+    return False
+
+
+def _is_direct_exec_package_manager(tokens: list[str]) -> bool:
+    command = _command_name(tokens[0])
+    args = [token.lower() for token in tokens[1:]]
+    return command in {"npx", "bunx"} or (command == "pnpm" and bool(args) and args[0] == "exec")
+
+
+def _is_cd_to_temp_dir(tokens: list[str]) -> bool:
+    return _is_cd_to_path(tokens, {"/tmp", "/var/tmp"})
+
+
+def _is_cd_to_non_temp_dir(tokens: list[str]) -> bool:
+    if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
+        return False
+    path = tokens[1].rstrip("/")
+    return path not in {"/tmp", "/var/tmp"}
+
+
+def _is_cd_to_path(tokens: list[str], paths: set[str]) -> bool:
+    if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
+        return False
+    return tokens[1].rstrip("/") in paths
 
 
 def _is_sensitive_path(token: str) -> bool:
