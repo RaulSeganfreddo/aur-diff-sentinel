@@ -86,14 +86,7 @@ def review_updates(
             review.baseline_available = True
 
         if review.baseline_available:
-            diff_text = cache.diff_baseline_to_latest(update.package, latest_dir)
-            install_references = _install_references(latest_dir)
-            review.findings = _dedupe_findings(
-                [
-                    *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
-                    *analyze_metadata_tree_changes(cache.baseline_dir(update.package), latest_dir),
-                ]
-            )
+            review.findings = _review_metadata_changes(cache, update.package, latest_dir)
         else:
             review.findings = _scan_latest_metadata(latest_dir)
 
@@ -205,14 +198,7 @@ def _refresh_candidate(
         review.notes.append("Review baseline was not refreshed.")
         return review
 
-    diff_text = cache.diff_baseline_to_latest(update.package, candidate.latest_dir)
-    install_references = _install_references(candidate.latest_dir)
-    review.findings = _dedupe_findings(
-        [
-            *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
-            *analyze_metadata_tree_changes(cache.baseline_dir(update.package), candidate.latest_dir),
-        ]
-    )
+    review.findings = _review_metadata_changes(cache, update.package, candidate.latest_dir)
     if review.findings and not force:
         review.refresh_blocked = True
         review.notes.append("Review baseline was not refreshed.")
@@ -224,6 +210,17 @@ def _refresh_candidate(
         f"Refreshed review baseline for installed version {update.new_version}."
     )
     return review
+
+
+def _review_metadata_changes(cache: AurCache, package: str, latest_dir: Path) -> list[Finding]:
+    diff_text = cache.diff_baseline_to_latest(package, latest_dir)
+    install_references = _install_references(latest_dir)
+    return _dedupe_findings(
+        [
+            *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
+            *analyze_metadata_tree_changes(cache.baseline_dir(package), latest_dir),
+        ]
+    )
 
 
 def _scan_latest_metadata(latest_dir: Path) -> list[Finding]:

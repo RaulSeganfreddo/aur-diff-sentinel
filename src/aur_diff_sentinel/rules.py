@@ -1,19 +1,21 @@
 from __future__ import annotations
 
-import os
 import re
-import shlex
 
+from aur_diff_sentinel.command_analysis import (
+    is_direct_exec_package_manager,
+    uses_js_package_manager,
+)
 from aur_diff_sentinel.models import Rule, Severity, SourceLine
+from aur_diff_sentinel.shell_analysis import shell_commands
+from aur_diff_sentinel.shell_analysis import tokens_from_shell_segment
 
 
 BUILD_FUNCTIONS = {"prepare", "build", "check", "package"}
 SCRIPTLET_CONTEXTS = {"scriptlet", "hook"}
 SENSITIVE_PATH_PREFIXES = ("/usr", "/etc", "/var", "/home", "/root")
 
-ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=.*$")
 HOOK_EXEC_RE = re.compile(r"^\s*Exec\s*=", re.IGNORECASE)
-EXEC_VALUE_RE = re.compile(r"^\s*Exec\s*=\s*(.*)$", re.IGNORECASE)
 
 NETWORK_IN_BUILD_RE = re.compile(
     r"(^\s*|[;&|]\s*)("
@@ -43,18 +45,6 @@ def _network_in_build(line: SourceLine) -> bool:
     )
 
 
-def uses_js_package_manager(content: str) -> bool:
-    return any(is_js_package_manager_command(tokens) for tokens in shell_commands(content))
-
-
-def changes_to_temp_dir(content: str) -> bool:
-    return any(is_cd_to_temp_dir(tokens) for tokens in shell_commands(content))
-
-
-def changes_to_non_temp_dir(content: str) -> bool:
-    return any(is_cd_to_non_temp_dir(tokens) for tokens in shell_commands(content))
-
-
 def _scriptlet_package_manager(line: SourceLine) -> bool:
     return line.execution_context in SCRIPTLET_CONTEXTS and uses_js_package_manager(line.content)
 
@@ -67,205 +57,6 @@ def _pacman_hook_exec(line: SourceLine) -> bool:
     return line.execution_context == "hook" and HOOK_EXEC_RE.match(line.content) is not None
 
 
-def shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
-    if depth > 2:
-        return []
-
-    content = _exec_value(content)
-    commands: list[list[str]] = []
-    for segment in _split_shell_segments(content):
-        tokens = _tokens(segment)
-        tokens = _strip_command_prefix(tokens)
-        if not tokens:
-            continue
-        shell_payload = _shell_c_payload(tokens)
-        if shell_payload is not None:
-            commands.extend(shell_commands(shell_payload, depth=depth + 1))
-            continue
-        commands.append(tokens)
-    return commands
-
-
-def _exec_value(content: str) -> str:
-    match = EXEC_VALUE_RE.match(content)
-    if match:
-        return match.group(1)
-    return content
-
-
-def _split_shell_segments(content: str) -> list[str]:
-    segments: list[str] = []
-    current: list[str] = []
-    quote: str | None = None
-    escape = False
-    index = 0
-
-    while index < len(content):
-        char = content[index]
-        if escape:
-            current.append(char)
-            escape = False
-            index += 1
-            continue
-        if char == "\\":
-            current.append(char)
-            escape = True
-            index += 1
-            continue
-        if quote is not None:
-            current.append(char)
-            if char == quote:
-                quote = None
-            index += 1
-            continue
-        if char in {"'", '"'}:
-            current.append(char)
-            quote = char
-            index += 1
-            continue
-        if content.startswith("&&", index) or content.startswith("||", index):
-            _append_segment(segments, current)
-            current = []
-            index += 2
-            continue
-        if char in {";", "|"}:
-            _append_segment(segments, current)
-            current = []
-            index += 1
-            continue
-        current.append(char)
-        index += 1
-
-    _append_segment(segments, current)
-    return segments
-
-
-def _append_segment(segments: list[str], chars: list[str]) -> None:
-    segment = "".join(chars).strip()
-    if segment:
-        segments.append(segment)
-
-
-def _strip_command_prefix(tokens: list[str]) -> list[str]:
-    index = 0
-    while index < len(tokens) and ASSIGNMENT_RE.match(tokens[index]):
-        index += 1
-    while index < len(tokens):
-        command = _command_name(tokens[index])
-        if command == "env":
-            index = _strip_env_prefix(tokens, index + 1)
-            continue
-        if command == "command":
-            index = _strip_command_builtin_prefix(tokens, index + 1)
-            continue
-        break
-    return tokens[index:]
-
-
-def _strip_env_prefix(tokens: list[str], index: int) -> int:
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            return index + 1
-        if token in {"-i", "--ignore-environment", "-0", "--null"}:
-            index += 1
-            continue
-        if token in {"-u", "--unset"}:
-            index += 2
-            continue
-        if token.startswith("-u") and token != "-u":
-            index += 1
-            continue
-        if token.startswith("--unset="):
-            index += 1
-            continue
-        if ASSIGNMENT_RE.match(token):
-            index += 1
-            continue
-        break
-    return index
-
-
-def _strip_command_builtin_prefix(tokens: list[str], index: int) -> int:
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "--":
-            return index + 1
-        if token in {"-p"}:
-            index += 1
-            continue
-        break
-    return index
-
-
-def _shell_c_payload(tokens: list[str]) -> str | None:
-    if _command_name(tokens[0]) not in {"sh", "bash"}:
-        return None
-    index = 1
-    while index < len(tokens):
-        token = tokens[index]
-        if token == "-c":
-            if index + 1 < len(tokens):
-                return tokens[index + 1]
-            return None
-        if token.startswith("-") and "c" in token[1:]:
-            if index + 1 < len(tokens):
-                return tokens[index + 1]
-            return None
-        index += 1
-    return None
-
-
-def _command_name(token: str) -> str:
-    return os.path.basename(token).lower()
-
-
-def is_js_package_manager_command(tokens: list[str]) -> bool:
-    command = _command_name(tokens[0])
-    args = [token.lower() for token in tokens[1:]]
-    if command == "npm":
-        return bool(args) and args[0] in {"install", "add", "ci", "i", "exec"}
-    if command == "npx":
-        return True
-    if command == "bun":
-        return bool(args) and args[0] in {"add", "install", "i"}
-    if command == "bunx":
-        return True
-    if command == "yarn":
-        return not args or args[0] in {"add", "install", "dlx"}
-    if command == "pnpm":
-        return bool(args) and args[0] in {"add", "install", "exec", "dlx"}
-    return False
-
-
-def is_direct_exec_package_manager(tokens: list[str]) -> bool:
-    command = _command_name(tokens[0])
-    args = [token.lower() for token in tokens[1:]]
-    return (
-        command in {"npx", "bunx"}
-        or (command == "npm" and bool(args) and args[0] == "exec")
-        or (command == "yarn" and bool(args) and args[0] == "dlx")
-        or (command == "pnpm" and bool(args) and args[0] in {"exec", "dlx"})
-    )
-
-
-def is_cd_to_temp_dir(tokens: list[str]) -> bool:
-    if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
-        return False
-    return _is_temp_path(tokens[1])
-
-
-def is_cd_to_non_temp_dir(tokens: list[str]) -> bool:
-    if _command_name(tokens[0]) != "cd" or len(tokens) < 2:
-        return False
-    return not _is_temp_path(tokens[1])
-
-
-def _is_temp_path(path: str) -> bool:
-    normalized = path.rstrip("/")
-    return normalized in {"/tmp", "/var/tmp"} or normalized.startswith("/tmp/") or normalized.startswith("/var/tmp/")
-
-
 def _is_sensitive_path(token: str) -> bool:
     return any(
         token == prefix or token.startswith(f"{prefix}/")
@@ -274,10 +65,7 @@ def _is_sensitive_path(token: str) -> bool:
 
 
 def _tokens(line: str) -> list[str]:
-    try:
-        return shlex.split(line, comments=False, posix=True)
-    except ValueError:
-        return line.split()
+    return tokens_from_shell_segment(line)
 
 
 def _non_option_tokens(tokens: list[str]) -> list[str]:
