@@ -1073,7 +1073,7 @@ class ScannerTests(unittest.TestCase):
 
         self.assertEqual(finding.new_value, "https://example.org/archive_(x86_64).tar.gz")
 
-    def test_diff_generic_dependency_added_is_not_reported(self) -> None:
+    def test_diff_generic_dependency_added_is_low(self) -> None:
         text = "\n".join(
             [
                 "diff --git a/PKGBUILD b/PKGBUILD",
@@ -1084,9 +1084,15 @@ class ScannerTests(unittest.TestCase):
                 "+depends=(foo bar)",
             ]
         )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
+        findings = scan_diff_text(text)
+        ids = {finding.rule_id for finding in findings}
 
         self.assertNotIn("javascript-tooling-dependency-added", ids)
+        self.assertIn("dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.LOW)
+        self.assertEqual(dep_findings[0].new_value, "bar")
 
     def test_diff_dependency_move_is_not_runtime_addition(self) -> None:
         text = "\n".join(
@@ -1177,5 +1183,351 @@ class ScannerTests(unittest.TestCase):
         self.assertIn("pacman-hook-added", ids)
         self.assertIn("pacman-hook-exec", ids)
         self.assertIn("scriptlet-package-manager", ids)
+
+    def test_diff_dependency_added_in_makedepends_is_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-makedepends=(git)",
+                "+makedepends=(git cmake)",
+            ]
+        )
+        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, Severity.LOW)
+        self.assertEqual(findings[0].new_value, "cmake")
+
+    def test_diff_dependency_added_in_checkdepends_is_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-checkdepends=(foo)",
+                "+checkdepends=(foo bar)",
+            ]
+        )
+        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, Severity.LOW)
+        self.assertEqual(findings[0].new_value, "bar")
+
+    def test_diff_dependency_added_in_optdepends_is_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-optdepends=(foo)",
+                "+optdepends=(foo bar)",
+            ]
+        )
+        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, Severity.LOW)
+        self.assertEqual(findings[0].new_value, "bar")
+
+    def test_diff_arch_specific_dependency_added_is_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends_x86_64=(foo)",
+                "+depends_x86_64=(foo bar)",
+            ]
+        )
+        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].severity, Severity.LOW)
+        self.assertEqual(findings[0].new_value, "bar")
+
+    def test_diff_build_tool_dependency_added_is_medium(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo cargo)",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("build-tool-dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "build-tool-dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
+        self.assertEqual(dep_findings[0].new_value, "cargo")
+
+    def test_diff_aur_dependency_added_is_medium_via_heuristic(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar-git)",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("aur-dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
+        self.assertEqual(dep_findings[0].new_value, "bar-git")
+
+    def test_diff_aur_dependency_added_is_medium_via_callable(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo unknown-aur-pkg)",
+            ]
+        )
+        findings = scan_diff_text(
+            text,
+            is_aur_package=lambda pkg: pkg == "unknown-aur-pkg",
+        )
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("aur-dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
+        self.assertEqual(dep_findings[0].new_value, "unknown-aur-pkg")
+
+    def test_diff_official_dependency_added_is_low_via_callable(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bash)",
+            ]
+        )
+        findings = scan_diff_text(
+            text,
+            is_aur_package=lambda pkg: False if pkg == "bash" else True,
+        )
+        ids = {f.rule_id for f in findings}
+        self.assertNotIn("aur-dependency-added", ids)
+        self.assertIn("dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.LOW)
+        self.assertEqual(dep_findings[0].new_value, "bash")
+
+    def test_diff_aur_heuristic_priority_over_build_tool(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo cargo-git)",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("aur-dependency-added", ids)
+        self.assertNotIn("build-tool-dependency-added", ids)
+
+    def test_diff_dependency_with_install_script_is_high(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,2 +1,2 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+                "-install=",
+                "+install=example.install",
+                "diff --git a/example.install b/example.install",
+                "--- /dev/null",
+                "+++ b/example.install",
+                "@@ -0,0 +1 @@",
+                "+#!/bin/bash",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("dependency-added", ids)
+        self.assertIn("install-script-added", ids)
+        self.assertIn("aur-metadata-executable-added", ids)
+        self.assertIn("dependency-with-risk-signals", ids)
+        composite = [f for f in findings if f.rule_id == "dependency-with-risk-signals"]
+        self.assertEqual(len(composite), 1)
+        self.assertEqual(composite[0].severity, Severity.HIGH)
+
+    def test_diff_dependency_with_source_domain_change_is_high(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,3 +1,3 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+                "-source=('https://old.example/file.tar.gz')",
+                "+source=('https://new.example/file.tar.gz')",
+                "-sha256sums=('abc')",
+                "+sha256sums=('def')",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+
+        self.assertIn("dependency-added", ids)
+        self.assertIn("source-domain-changed", ids)
+        self.assertIn("dependency-with-risk-signals", ids)
+        composite = [f for f in findings if f.rule_id == "dependency-with-risk-signals"]
+        self.assertEqual(len(composite), 1)
+        self.assertEqual(composite[0].severity, Severity.HIGH)
+
+    def test_diff_dependency_without_risk_signals_is_not_high(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+            ]
+        )
+        ids = {f.rule_id for f in scan_diff_text(text)}
+        self.assertNotIn("dependency-with-risk-signals", ids)
+
+    def test_diff_srcinfo_dependency_added_is_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/.SRCINFO b/.SRCINFO",
+                "--- a/.SRCINFO",
+                "+++ b/.SRCINFO",
+                "@@ -1,2 +1,3 @@",
+                " depends = foo",
+                " makedepends = git",
+                "+depends = bar",
+            ]
+        )
+        findings = scan_diff_text(text)
+        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.LOW)
+        self.assertEqual(dep_findings[0].new_value, "bar")
+
+    def test_diff_srcinfo_dependency_not_duplicated_with_pkgbuild(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+                "diff --git a/.SRCINFO b/.SRCINFO",
+                "--- a/.SRCINFO",
+                "+++ b/.SRCINFO",
+                "@@ -1 +1,2 @@",
+                " depends = foo",
+                "+depends = bar",
+            ]
+        )
+        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
+        self.assertEqual(len(findings), 1)
+        self.assertEqual(findings[0].filename, "PKGBUILD")
+
+    def test_diff_srcinfo_build_tool_dependency_is_medium(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/.SRCINFO b/.SRCINFO",
+                "--- a/.SRCINFO",
+                "+++ b/.SRCINFO",
+                "@@ -1 +1,2 @@",
+                " depends = foo",
+                "+makedepends = cargo",
+            ]
+        )
+        findings = scan_diff_text(text)
+        dep_findings = [f for f in findings if f.rule_id == "build-tool-dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
+        self.assertEqual(dep_findings[0].new_value, "cargo")
+
+    def test_diff_srcinfo_aur_dependency_is_medium(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/.SRCINFO b/.SRCINFO",
+                "--- a/.SRCINFO",
+                "+++ b/.SRCINFO",
+                "@@ -1 +1,2 @@",
+                " depends = foo",
+                "+depends = bar-bin",
+            ]
+        )
+        findings = scan_diff_text(text)
+        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
+        self.assertEqual(dep_findings[0].new_value, "bar-bin")
+
+    def test_diff_dependency_removed_still_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1 +1 @@",
+                "-depends=(foo bar)",
+                "+depends=(foo)",
+            ]
+        )
+        findings = scan_diff_text(text)
+        dep_findings = [f for f in findings if f.rule_id == "dependency-removed"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.LOW)
+        self.assertEqual(dep_findings[0].old_value, "bar")
+
+    def test_diff_dependency_moved_still_low(self) -> None:
+        text = "\n".join(
+            [
+                "diff --git a/PKGBUILD b/PKGBUILD",
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,2 +1,2 @@",
+                "-makedepends=(bar)",
+                "+makedepends=()",
+                "-depends=(foo)",
+                "+depends=(foo bar)",
+            ]
+        )
+        findings = scan_diff_text(text)
+        ids = {f.rule_id for f in findings}
+        self.assertIn("dependency-moved", ids)
+        self.assertNotIn("dependency-added", ids)
+        dep_findings = [f for f in findings if f.rule_id == "dependency-moved"]
+        self.assertEqual(len(dep_findings), 1)
+        self.assertEqual(dep_findings[0].severity, Severity.LOW)
 
 

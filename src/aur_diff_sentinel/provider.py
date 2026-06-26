@@ -113,6 +113,26 @@ def validate_package_name(package: str) -> None:
         raise RuntimeError(f"invalid AUR package name: {package!r}")
 
 
+_AUR_NAME_PATTERN = re.compile(
+    r"-(?:git|bin|svn|hg|bzr|nightly|insider|alpha|beta|rc\d*|dev|patched|appindicator)$"
+)
+
+
+def is_aur_package(
+    package: str,
+    *,
+    runner: CommandRunner = default_runner,
+) -> bool:
+    if _AUR_NAME_PATTERN.search(package):
+        return True
+    try:
+        validate_package_name(package)
+        result = runner(["pacman", "-Si", package])
+    except (RuntimeError, OSError):
+        return False
+    return result.returncode != 0
+
+
 def parse_update_output(output: str) -> list[AurUpdate]:
     updates: list[AurUpdate] = []
 

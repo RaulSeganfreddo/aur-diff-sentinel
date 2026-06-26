@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -8,7 +9,7 @@ from typing import Callable
 from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.diff_analysis import analyze_metadata_tree_changes
 from aur_diff_sentinel.models import Finding
-from aur_diff_sentinel.provider import AurUpdate, installed_version
+from aur_diff_sentinel.provider import AurUpdate, default_runner, is_aur_package, installed_version
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 
 
@@ -215,9 +216,10 @@ def _refresh_candidate(
 def _review_metadata_changes(cache: AurCache, package: str, latest_dir: Path) -> list[Finding]:
     diff_text = cache.diff_baseline_to_latest(package, latest_dir)
     install_references = _install_references(latest_dir)
+    aur_checker = functools.lru_cache(maxsize=None)(lambda pkg: is_aur_package(pkg, runner=default_runner))
     return _dedupe_findings(
         [
-            *(scan_diff_text(diff_text, scriptlet_files=install_references) if diff_text else []),
+            *(scan_diff_text(diff_text, scriptlet_files=install_references, is_aur_package=aur_checker) if diff_text else []),
             *analyze_metadata_tree_changes(cache.baseline_dir(package), latest_dir),
         ]
     )

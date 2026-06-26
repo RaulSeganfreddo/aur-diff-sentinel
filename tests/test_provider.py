@@ -18,6 +18,7 @@ from aur_diff_sentinel.provider import (
     AurUpdate,
     InstalledPackageStatus,
     discover_updates,
+    is_aur_package,
     parse_update_output,
     query_installed_package,
 )
@@ -124,5 +125,56 @@ class ProviderTests(unittest.TestCase):
         unknown = query_installed_package("example-bin", runner=unknown_runner)
         self.assertFalse(unknown.missing)
         self.assertEqual(unknown.error, "pacman database error")
+
+    def test_is_aur_package_git_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-git"))
+
+    def test_is_aur_package_bin_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-bin"))
+
+    def test_is_aur_package_svn_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-svn"))
+
+    def test_is_aur_package_hg_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-hg"))
+
+    def test_is_aur_package_bzr_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-bzr"))
+
+    def test_is_aur_package_nightly_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-nightly"))
+
+    def test_is_aur_package_beta_suffix(self) -> None:
+        self.assertTrue(is_aur_package("foo-beta"))
+
+    def test_is_aur_package_normal_name_found_in_repo(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, "Repository : extra\nName : bash\n", "")
+
+        self.assertFalse(is_aur_package("bash", runner=runner))
+
+    def test_is_aur_package_normal_name_not_in_repo(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 1, "", "error: package 'unknown' was not found")
+
+        self.assertTrue(is_aur_package("unknown", runner=runner))
+
+    def test_is_aur_package_normal_name_empty_stdout(self) -> None:
+        def runner(command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        self.assertFalse(is_aur_package("bash", runner=runner))
+
+    def test_is_aur_package_pacman_oserror_fallback(self) -> None:
+        def runner(_command: list[str]) -> subprocess.CompletedProcess[str]:
+            raise OSError("pacman not found")
+
+        self.assertFalse(is_aur_package("normal-pkg", runner=runner))
+
+    def test_is_aur_package_heuristic_takes_priority(self) -> None:
+        def runner(_command: list[str]) -> subprocess.CompletedProcess[str]:
+            return subprocess.CompletedProcess([], 0, "Repository : extra\nName : foo-git\n", "")
+
+        self.assertTrue(is_aur_package("foo-git", runner=runner))
 
 

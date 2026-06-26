@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+
 from aur_diff_sentinel.dependency_diff import (
     dedupe_srcinfo_dependency_findings,
     find_dependency_changes,
@@ -17,7 +19,11 @@ from aur_diff_sentinel.source_checksum_diff import (
 )
 
 
-def analyze_source_diff(text: str) -> list[Finding]:
+def analyze_source_diff(
+    text: str,
+    *,
+    is_aur_package: Callable[[str], bool] | None = None,
+) -> list[Finding]:
     arrays = collect_diff_arrays(text)
     findings: list[Finding] = []
 
@@ -27,8 +33,13 @@ def analyze_source_diff(text: str) -> list[Finding]:
     findings.extend(find_checksum_algorithm_weakening(arrays))
     findings.extend(find_checksum_count_mismatches(arrays))
     findings.extend(find_added_checksum_skips(arrays))
-    findings.extend(find_dependency_changes(arrays))
-    findings.extend(dedupe_srcinfo_dependency_findings(findings, find_srcinfo_dependency_changes(text)))
+    findings.extend(find_dependency_changes(arrays, is_aur_package=is_aur_package))
+    findings.extend(
+        dedupe_srcinfo_dependency_findings(
+            findings,
+            find_srcinfo_dependency_changes(text, is_aur_package=is_aur_package),
+        )
+    )
 
     return findings
 

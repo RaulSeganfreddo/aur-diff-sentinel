@@ -60,6 +60,12 @@ def sequence_findings(lines: list[SourceLine]) -> list[Finding]:
 
 
 def with_composite_findings(findings: list[Finding]) -> list[Finding]:
+    findings = _add_suspicious_live_install_sequence(findings)
+    findings = _add_dependency_risk_composite(findings)
+    return findings
+
+
+def _add_suspicious_live_install_sequence(findings: list[Finding]) -> list[Finding]:
     ids = {finding.rule_id for finding in findings}
     has_script_entry = bool(
         ids
@@ -96,6 +102,69 @@ def with_composite_findings(findings: list[Finding]) -> list[Finding]:
             hint=(
                 "A new JavaScript tooling dependency, install script or hook, "
                 "temporary directory, and package-manager command appeared together."
+            ),
+            filename=anchor.filename,
+            source_type=anchor.source_type,
+            diff_line_number=anchor.diff_line_number,
+            target_line_number=anchor.target_line_number,
+            change_type=anchor.change_type,
+            function_name=anchor.function_name,
+            execution_context=anchor.execution_context,
+        ),
+    ]
+
+
+DEPENDENCY_ADDED_IDS = frozenset({
+    "javascript-tooling-dependency-added",
+    "build-tool-dependency-added",
+    "aur-dependency-added",
+    "dependency-added",
+})
+
+DEPENDENCY_RISK_SIGNALS = frozenset({
+    "install-script-added",
+    "pacman-hook-added",
+    "source-domain-changed",
+    "checksum-skip-added",
+    "checksum-array-removed",
+    "checksum-algorithm-weakened",
+    "network-in-build",
+    "direct-exec-package-manager",
+    "decoded-pipe-shell",
+    "curl-pipe-shell",
+    "eval-used",
+    "setuid-permission",
+    "privilege-command",
+    "scriptlet-package-manager",
+    "temporary-directory-package-install",
+})
+
+
+def _add_dependency_risk_composite(findings: list[Finding]) -> list[Finding]:
+    ids = {finding.rule_id for finding in findings}
+    has_dep = bool(ids & DEPENDENCY_ADDED_IDS)
+    has_risk = bool(ids & DEPENDENCY_RISK_SIGNALS)
+    if not (has_dep and has_risk):
+        return findings
+    if "dependency-with-risk-signals" in ids:
+        return findings
+
+    anchor = next(
+        finding
+        for finding in findings
+        if finding.rule_id in DEPENDENCY_RISK_SIGNALS
+    )
+    return [
+        *findings,
+        Finding(
+            rule_id="dependency-with-risk-signals",
+            severity=Severity.HIGH,
+            message="New dependency combined with high-risk signals",
+            line_number=anchor.line_number,
+            line_content=anchor.line_content,
+            hint=(
+                "New dependencies appeared together with other high-risk signals. "
+                "Combined review is strongly recommended."
             ),
             filename=anchor.filename,
             source_type=anchor.source_type,

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Sequence
 
 from aur_diff_sentinel.correlation import sequence_findings, with_composite_findings
 from aur_diff_sentinel.diff_analysis import analyze_source_diff
@@ -248,12 +248,13 @@ def scan_diff_text(
     filename: str | None = None,
     *,
     scriptlet_files: Collection[str] | None = None,
+    is_aur_package: Callable[[str], bool] | None = None,
 ) -> list[Finding]:
     lines = source_lines_from_diff(text, filename=filename, scriptlet_files=scriptlet_files)
     line_findings = scan_lines(lines, rules=rules)
     if rules is RULES:
         line_findings.extend(sequence_findings(lines))
-    diff_findings = analyze_source_diff(text)
+    diff_findings = analyze_source_diff(text, is_aur_package=is_aur_package)
     contextual_skip_locations = {
         (finding.filename, finding.line_number)
         for finding in diff_findings
