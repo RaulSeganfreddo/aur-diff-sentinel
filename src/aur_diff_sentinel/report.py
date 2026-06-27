@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 
+from aur_diff_sentinel.explanations import EXPLANATIONS
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult
 
@@ -46,7 +47,7 @@ REASON_PHRASES = {
 REASON_LIMIT = 3
 
 
-def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
+def format_findings(findings: list[Finding], *, verbose: bool = False, explain: bool = False) -> str:
     lines: list[str] = []
     counts = Counter(finding.severity for finding in findings)
 
@@ -61,6 +62,10 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
             lines.append(severity.value)
             for finding in severity_findings:
                 lines.append(_format_finding(finding))
+                if explain:
+                    explanation = _format_explanation(finding)
+                    if explanation:
+                        lines.append(explanation)
                 if verbose:
                     lines.append(f"  line: {finding.line_content}")
                     if finding.execution_context or finding.function_name:
@@ -81,7 +86,7 @@ def format_findings(findings: list[Finding], *, verbose: bool = False) -> str:
     return "\n".join(lines)
 
 
-def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -> str:
+def format_update_review(result: UpdateReviewResult, *, verbose: bool = False, explain: bool = False) -> str:
     if not result.reviews:
         if result.refresh_requested and result.cache_refresh:
             lines = ["No reviewed metadata was ready to refresh."]
@@ -115,7 +120,7 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False) -
             lines.append(f"  note: {note}")
 
         if review.findings:
-            lines.append(_indent(format_findings(review.findings, verbose=verbose)))
+            lines.append(_indent(format_findings(review.findings, verbose=verbose, explain=explain)))
         else:
             lines.append("  No findings.")
         lines.append("")
@@ -248,6 +253,20 @@ def _reason_summary(findings: list[Finding]) -> str:
 
 def _indent(text: str) -> str:
     return "\n".join(f"  {line}" if line else "" for line in text.splitlines())
+
+
+def _format_explanation(finding: Finding) -> str:
+    explanation = EXPLANATIONS.get(finding.rule_id)
+    if explanation is None:
+        return ""
+    return "\n".join(
+        [
+            "",
+            f"  What:    {explanation.what}",
+            f"  Why:     {explanation.why}",
+            f"  Inspect: {explanation.inspect}",
+        ]
+    )
 
 
 def _format_finding(finding: Finding) -> str:

@@ -13,6 +13,7 @@ from unittest.mock import patch
 from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
 from aur_diff_sentinel.cache import AurCache, metadata_version, unified_diff_dirs
 from aur_diff_sentinel.cli import run
+from aur_diff_sentinel.explanations import EXPLANATIONS
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import (
     AurUpdate,
@@ -278,6 +279,95 @@ class ReportTests(unittest.TestCase):
         self.assertIn("old: https://old.example/app.tar.gz", report)
         self.assertIn("new: https://new.example/app.tar.gz", report)
         self.assertIn("hint: review this finding", report)
+
+    def test_explain_adds_what_why_inspect_block(self) -> None:
+        findings = [
+            _finding("source-domain-changed", Severity.HIGH),
+        ]
+        report = format_findings(findings, explain=True)
+
+        self.assertIn("What:", report)
+        self.assertIn("Why:", report)
+        self.assertIn("Inspect:", report)
+        self.assertIn("package source moved", report)
+
+    def test_explain_does_not_appear_when_disabled(self) -> None:
+        findings = [
+            _finding("source-domain-changed", Severity.HIGH),
+        ]
+        report = format_findings(findings, explain=False)
+
+        self.assertNotIn("What:", report)
+        self.assertNotIn("Why:", report)
+        self.assertNotIn("Inspect:", report)
+
+    def test_explain_unknown_rule_id_is_silent(self) -> None:
+        findings = [
+            _finding("source-domain-changed", Severity.HIGH),
+            Finding(
+                rule_id="unknown-rule",
+                severity=Severity.LOW,
+                message="unknown",
+                line_number=10,
+                line_content="test",
+                hint="test",
+            ),
+        ]
+        report = format_findings(findings, explain=True)
+
+        self.assertEqual(report.count("What:"), 1)
+
+    def test_explain_works_with_verbose(self) -> None:
+        findings = [
+            _finding("source-domain-changed", Severity.HIGH),
+        ]
+        report = format_findings(findings, verbose=True, explain=True)
+
+        self.assertIn("What:", report)
+        self.assertIn("line:", report)
+        self.assertIn("hint:", report)
+
+    def test_all_current_rule_ids_have_explanations(self) -> None:
+        current_rule_ids = {
+            "eval-used",
+            "curl-pipe-shell",
+            "setuid-permission",
+            "privilege-command",
+            "install-script",
+            "pacman-hook-exec",
+            "shell-c",
+            "source-command",
+            "decoded-pipe-shell",
+            "inline-interpreter-command",
+            "scriptlet-package-manager",
+            "direct-exec-package-manager",
+            "network-in-build",
+            "writes-outside-pkgdir",
+            "checksum-skip",
+            "source-url-added",
+            "https-to-http-downgrade",
+            "source-domain-changed",
+            "checksum-array-removed",
+            "checksum-algorithm-weakened",
+            "checksum-count-mismatch",
+            "checksum-skip-added",
+            "install-script-added",
+            "pacman-hook-added",
+            "aur-metadata-executable-added",
+            "aur-metadata-elf-added",
+            "dependency-added",
+            "javascript-tooling-dependency-added",
+            "build-tool-dependency-added",
+            "aur-dependency-added",
+            "dependency-moved",
+            "dependency-removed",
+            "temporary-directory-package-install",
+            "suspicious-live-install-sequence",
+            "dependency-with-risk-signals",
+        }
+        for rule_id in current_rule_ids:
+            with self.subTest(rule_id=rule_id):
+                self.assertIn(rule_id, EXPLANATIONS, f"Missing explanation for {rule_id}")
 
 
 def _finding(

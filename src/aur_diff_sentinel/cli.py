@@ -20,9 +20,9 @@ from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_updates
 
 
-MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] PATH
-       aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose]
-       aur-diff-sentinel baseline refresh [--helper {paru,yay}] [--cache-dir PATH] [--force] [--verbose]
+MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] [--explain] PATH
+       aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose] [--explain]
+       aur-diff-sentinel baseline refresh [--helper {paru,yay}] [--cache-dir PATH] [--force] [--verbose] [--explain]
        aur-diff-sentinel baseline status [--cache-dir PATH]
        aur-diff-sentinel baseline prune [--cache-dir PATH] [--all]
 
@@ -37,6 +37,7 @@ commands:
 scan options:
   --diff            scan only added lines from a unified diff
   --verbose         show matched source lines and rule hints
+  --explain         show what, why, and inspect guidance for each finding
 """
 
 COMMANDS = ("updates", "baseline")
@@ -58,6 +59,11 @@ def build_scan_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="show matched source lines and rule hints",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="show what, why, and inspect guidance for each finding",
     )
     return parser
 
@@ -82,6 +88,11 @@ def build_updates_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="show matched source lines and rule hints",
+    )
+    parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="show what, why, and inspect guidance for each finding",
     )
     return parser
 
@@ -116,6 +127,11 @@ def build_baseline_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="show matched source lines and rule hints",
+    )
+    refresh.add_argument(
+        "--explain",
+        action="store_true",
+        help="show what, why, and inspect guidance for each finding",
     )
     status = subparsers.add_parser(
         "status",
@@ -197,7 +213,7 @@ def run(
     else:
         findings = scan_text(text, filename=str(path))
 
-    print(format_findings(findings, verbose=args.verbose), file=stdout)
+    print(format_findings(findings, verbose=args.verbose, explain=args.explain), file=stdout)
     return 1 if findings else 0
 
 
@@ -220,7 +236,7 @@ def _run_updates(
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
-    print(format_update_review(result, verbose=args.verbose), file=stdout)
+    print(format_update_review(result, verbose=args.verbose, explain=args.explain), file=stdout)
     return 1 if result.has_findings else 0
 
 
@@ -251,7 +267,7 @@ def _run_baseline(
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
-    print(format_update_review(result, verbose=args.verbose), file=stdout)
+    print(format_update_review(result, verbose=args.verbose, explain=args.explain), file=stdout)
     if result.refresh_blocked:
         return 2
     return 1 if result.has_findings else 0
