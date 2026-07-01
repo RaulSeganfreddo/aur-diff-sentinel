@@ -1,25 +1,22 @@
 from __future__ import annotations
 
 import re
-import shlex
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from aur_diff_sentinel.models import Finding, Severity
+from aur_diff_sentinel.pkgbuild_syntax import (
+    SOURCE_ARRAY_RE,
+    array_suffix,
+    is_checksum_name,
+    is_vcs_source,
+    split_array_values,
+)
 
 
 ARRAY_START_RE = re.compile(
     r"^\s*(source(?:_[a-z0-9_]+)?|(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)\s*=\s*(.*)$",
     re.IGNORECASE,
 )
-SOURCE_ARRAY_RE = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.IGNORECASE)
-CHECKSUM_ARRAY_RE = re.compile(
-    r"^(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?P<suffix>_[a-z0-9_]+)?$",
-    re.IGNORECASE,
-)
-VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
-
-
 @dataclass(frozen=True)
 class PkgbuildArrayValue:
     name: str
@@ -30,15 +27,7 @@ class PkgbuildArrayValue:
 
     @property
     def suffix(self) -> str:
-        source_match = SOURCE_ARRAY_RE.match(self.name)
-        if source_match:
-            return source_match.group("suffix") or ""
-
-        checksum_match = CHECKSUM_ARRAY_RE.match(self.name)
-        if checksum_match:
-            return checksum_match.group("suffix") or ""
-
-        return ""
+        return array_suffix(self.name)
 
 
 @dataclass
@@ -57,7 +46,7 @@ def analyze_pkgbuild_checksums(text: str, *, filename: str | None = None) -> lis
             continue
 
         source = _source_for_checksum(checksum, sources_by_suffix)
-        severity = Severity.MEDIUM if _is_vcs_source(source) else Severity.HIGH
+        severity = Severity.MEDIUM if is_vcs_source(source) else Severity.HIGH
         findings.append(
             Finding(
                 rule_id="checksum-skip",
@@ -131,10 +120,7 @@ def _append_values(
 
 
 def _split_values(segment: str) -> list[str]:
-    try:
-        return shlex.split(segment, comments=True, posix=True)
-    except ValueError:
-        return []
+    return split_array_values(segment)
 
 
 def _sources_by_suffix(
@@ -158,20 +144,7 @@ def _source_for_checksum(
 
 
 def _is_checksum(value: PkgbuildArrayValue) -> bool:
-    return CHECKSUM_ARRAY_RE.match(value.name) is not None
-
-
-def _is_vcs_source(source: str | None) -> bool:
-    if source is None:
-        return False
-    lowered = _source_without_alias(source).lower()
-    return lowered.startswith(VCS_PREFIXES) or urlparse(lowered).path.endswith(".git")
-
-
-def _source_without_alias(source: str) -> str:
-    if "::" not in source:
-        return source
-    return source.split("::", 1)[1]
+    return is_checksum_name(value.name)
 
 
 def _checksum_skip_hint(severity: Severity) -> str:

@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from aur_diff_sentinel.models import Finding, Severity
-from aur_diff_sentinel.pkgbuild_diff_parser import filename_from_diff_header
+from aur_diff_sentinel.unified_diff import iter_diff_files, iter_diff_lines
 
 
 ELF_MAGIC = b"\x7fELF"
@@ -46,50 +46,41 @@ def analyze_metadata_tree_changes(old_dir: Path, new_dir: Path) -> list[Finding]
 
 def find_added_metadata_files(text: str) -> list[Finding]:
     findings: list[Finding] = []
-    current_old: str | None = None
-    current_new: str | None = None
-    current_new_file = False
-    shell_file_reported = False
+    shell_files_reported: set[str] = set()
 
-    for raw_line in text.splitlines():
-        if raw_line.startswith("diff --git "):
-            current_old = None
-            current_new = None
-            current_new_file = False
-            shell_file_reported = False
+    for file_event in iter_diff_files(text):
+        current_new = file_event.new_filename
+        if not file_event.is_new_file or current_new is None:
             continue
-        if raw_line.startswith("---"):
-            current_old = filename_from_diff_header(raw_line)
+        if current_new.endswith(".install"):
+            findings.append(
+                metadata_file_finding(
+                    "install-script-added",
+                    Severity.MEDIUM,
+                    "Install script file added",
+                    "Install scripts can run on the live system during install, upgrade, or removal.",
+                    current_new,
+                )
+            )
+        elif current_new.endswith(".hook"):
+            findings.append(
+                metadata_file_finding(
+                    "pacman-hook-added",
+                    Severity.MEDIUM,
+                    "Pacman hook file added",
+                    "Pacman hooks can run automatically during package transactions.",
+                    current_new,
+                )
+            )
+
+    for line in iter_diff_lines(text):
+        current_new = line.file.new_filename
+        if not line.file.is_new_file or current_new is None:
             continue
-        if raw_line.startswith("+++"):
-            current_new = filename_from_diff_header(raw_line)
-            current_new_file = current_old is None and current_new is not None
-            if current_new_file and current_new is not None:
-                if current_new.endswith(".install"):
-                    findings.append(
-                        metadata_file_finding(
-                            "install-script-added",
-                            Severity.MEDIUM,
-                            "Install script file added",
-                            "Install scripts can run on the live system during install, upgrade, or removal.",
-                            current_new,
-                        )
-                    )
-                elif current_new.endswith(".hook"):
-                    findings.append(
-                        metadata_file_finding(
-                            "pacman-hook-added",
-                            Severity.MEDIUM,
-                            "Pacman hook file added",
-                            "Pacman hooks can run automatically during package transactions.",
-                            current_new,
-                        )
-                    )
+        if line.change_type != "added":
             continue
-        if not current_new_file or current_new is None or not raw_line.startswith("+"):
-            continue
-        content = raw_line[1:]
-        if not shell_file_reported and (
+        content = line.content
+        if current_new not in shell_files_reported and (
             content.startswith("#!/bin/sh")
             or content.startswith("#!/usr/bin/sh")
             or content.startswith("#!/bin/bash")
@@ -105,7 +96,7 @@ def find_added_metadata_files(text: str) -> list[Finding]:
                     line_content=content,
                 )
             )
-            shell_file_reported = True
+            shell_files_reported.add(current_new)
         if content.startswith("\x7fELF"):
             findings.append(
                 metadata_file_finding(

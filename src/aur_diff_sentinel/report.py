@@ -2,48 +2,11 @@ from __future__ import annotations
 
 from collections import Counter
 
-from aur_diff_sentinel.explanations import EXPLANATIONS
+from aur_diff_sentinel.explanations import EXPLANATIONS, reason_phrase
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult
 
 
-REASON_PHRASES = {
-    "source-domain-changed": "source domain changed",
-    "https-to-http-downgrade": "HTTPS changed to HTTP",
-    "source-url-added": "source URL added",
-    "checksum-skip-added": "checksum SKIP added",
-    "checksum-array-removed": "checksum array removed",
-    "checksum-algorithm-weakened": "checksum algorithm weakened",
-    "checksum-count-mismatch": "source/checksum count mismatch",
-    "checksum-skip": "checksum verification skipped",
-    "install-script": "install script referenced",
-    "install-script-added": "install script added",
-    "pacman-hook-added": "pacman hook added",
-    "pacman-hook-exec": "pacman hook action",
-    "scriptlet-package-manager": "package manager in live script",
-    "temporary-directory-package-install": "package install from temporary directory",
-    "direct-exec-package-manager": "package manager direct execution",
-    "javascript-tooling-dependency-added": "JavaScript tooling dependency added",
-    "build-tool-dependency-added": "build-tool dependency added",
-    "aur-dependency-added": "AUR dependency added",
-    "dependency-added": "new dependency added",
-    "dependency-moved": "dependency moved",
-    "dependency-removed": "dependency removed",
-    "dependency-with-risk-signals": "dependency combined with high-risk signals",
-    "aur-metadata-executable-added": "executable metadata file added",
-    "aur-metadata-elf-added": "ELF metadata file added",
-    "suspicious-live-install-sequence": "combined live install sequence",
-    "eval-used": "eval used",
-    "curl-pipe-shell": "remote download piped to shell",
-    "setuid-permission": "setuid/setgid permission",
-    "privilege-command": "live-system command",
-    "shell-c": "dynamic shell execution",
-    "source-command": "shell source command",
-    "decoded-pipe-shell": "decoded content piped into shell",
-    "inline-interpreter-command": "inline interpreter command",
-    "network-in-build": "network activity during build",
-    "writes-outside-pkgdir": "write outside pkgdir",
-}
 REASON_LIMIT = 3
 
 
@@ -240,7 +203,7 @@ def _reason_summary(findings: list[Finding]) -> str:
         for finding in findings:
             if finding.severity != severity:
                 continue
-            reason = REASON_PHRASES.get(finding.rule_id, finding.message.lower())
+            reason = reason_phrase(finding.rule_id, finding.message.lower())
             if reason not in reasons:
                 reasons.append(reason)
 

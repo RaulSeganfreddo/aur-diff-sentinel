@@ -54,6 +54,46 @@ def prune_cached_packages(cache: AurCache, packages: Sequence[str]) -> BaselineP
     return result
 
 
+def format_no_prune_candidates() -> str:
+    return "\n".join(
+        [
+            "No cached reviewed packages are missing from the system.",
+            "No packages were updated.",
+        ]
+    )
+
+
+def format_no_prune_selection() -> str:
+    return "\n".join(
+        [
+            "No sentinel cache entries were pruned.",
+            "No packages were updated.",
+        ]
+    )
+
+
+def format_prune_result(result: BaselinePruneResult) -> str:
+    lines = [
+        f"Pruned sentinel cache for packages no longer installed: {len(result.pruned)}",
+        "",
+    ]
+    lines.extend(f"- {package}" for package in result.pruned)
+    lines.extend(["", "No packages were updated."])
+    return "\n".join(lines)
+
+
+def format_unknown_prune_status(statuses: list[InstalledPackageStatus]) -> str:
+    if not statuses:
+        return ""
+    lines = ["Some cached reviewed packages could not be checked:", ""]
+    for status in statuses:
+        package = status.package
+        error = status.error or "unknown pacman error"
+        lines.append(f"- {package}: {error}")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def parse_prune_selection(selection: str, candidate_count: int) -> list[int]:
     value = selection.strip().lower()
     if not value or value == "none":

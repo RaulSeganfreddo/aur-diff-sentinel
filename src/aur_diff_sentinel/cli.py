@@ -8,13 +8,17 @@ from typing import TextIO
 
 from aur_diff_sentinel.baseline_prune import (
     SelectionError,
+    format_no_prune_candidates,
+    format_no_prune_selection,
+    format_prune_result,
+    format_unknown_prune_status,
     parse_prune_selection,
     prune_cached_packages,
     scan_prune_candidates,
 )
 from aur_diff_sentinel.baseline_status import format_baseline_status, scan_baseline_status
 from aur_diff_sentinel.cache import AurCache
-from aur_diff_sentinel.provider import InstalledPackageStatus, discover_updates
+from aur_diff_sentinel.provider import discover_updates
 from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_updates
@@ -292,11 +296,12 @@ def _run_baseline_prune(
 ) -> int:
     cache = AurCache(args.cache_dir)
     scan = scan_prune_candidates(cache)
-    _print_unknown_prune_status(scan.unknown, stdout=stdout)
+    unknown_status = format_unknown_prune_status(scan.unknown)
+    if unknown_status:
+        print(unknown_status, file=stdout)
 
     if not scan.candidates:
-        print("No cached reviewed packages are missing from the system.", file=stdout)
-        print("No packages were updated.", file=stdout)
+        print(format_no_prune_candidates(), file=stdout)
         return 0
 
     if args.all:
@@ -304,12 +309,10 @@ def _run_baseline_prune(
     else:
         selected_packages = _interactive_prune_selection(scan.candidates, stdout=stdout, stdin=stdin)
         if selected_packages is None:
-            print("No sentinel cache entries were pruned.", file=stdout)
-            print("No packages were updated.", file=stdout)
+            print(format_no_prune_selection(), file=stdout)
             return 0
         if not selected_packages:
-            print("No sentinel cache entries were pruned.", file=stdout)
-            print("No packages were updated.", file=stdout)
+            print(format_no_prune_selection(), file=stdout)
             return 0
 
     try:
@@ -318,12 +321,7 @@ def _run_baseline_prune(
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
-    print(f"Pruned sentinel cache for packages no longer installed: {len(result.pruned)}", file=stdout)
-    print("", file=stdout)
-    for package in result.pruned:
-        print(f"- {package}", file=stdout)
-    print("", file=stdout)
-    print("No packages were updated.", file=stdout)
+    print(format_prune_result(result), file=stdout)
     return 0
 
 
@@ -360,22 +358,6 @@ def _interactive_prune_selection(
     if answer not in {"y", "yes"}:
         return None
     return selected_packages
-
-
-def _print_unknown_prune_status(
-    statuses: list[InstalledPackageStatus],
-    *,
-    stdout: TextIO,
-) -> None:
-    if not statuses:
-        return
-    print("Some cached reviewed packages could not be checked:", file=stdout)
-    print("", file=stdout)
-    for status in statuses:
-        package = status.package
-        error = status.error or "unknown pacman error"
-        print(f"- {package}: {error}", file=stdout)
-    print("", file=stdout)
 
 
 def main() -> None:

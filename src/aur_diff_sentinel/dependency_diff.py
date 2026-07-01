@@ -6,16 +6,14 @@ from collections.abc import Callable
 from aur_diff_sentinel.diff_findings import value_finding
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.pkgbuild_diff_parser import (
-    HUNK_HEADER_RE,
     DiffArrays,
     DiffValue,
-    dependency_group,
     dependency_group_for,
-    dependency_name,
-    filename_from_diff_header,
     is_dependency,
     dependency_values_by_name,
 )
+from aur_diff_sentinel.pkgbuild_syntax import dependency_group, dependency_name
+from aur_diff_sentinel.unified_diff import iter_diff_lines
 
 
 JS_TOOLING_DEPENDENCIES = {"bun", "npm", "nodejs", "yarn", "pnpm"}
@@ -134,40 +132,17 @@ def find_srcinfo_dependency_changes(
 ) -> list[Finding]:
     added: list[DiffValue] = []
     removed_names: set[str] = set()
-    current_filename: str | None = None
-    old_line_number: int | None = None
-    new_line_number: int | None = None
 
-    for raw_line in text.splitlines():
-        if raw_line.startswith("diff --git "):
-            current_filename = None
-            old_line_number = None
-            new_line_number = None
-            continue
-        if raw_line.startswith("+++"):
-            current_filename = filename_from_diff_header(raw_line)
-            continue
-        hunk_match = HUNK_HEADER_RE.match(raw_line)
-        if hunk_match:
-            old_line_number = int(hunk_match.group(1))
-            new_line_number = int(hunk_match.group(2))
-            continue
-        if old_line_number is None or new_line_number is None:
-            continue
-        if raw_line.startswith("-") and not raw_line.startswith("---"):
-            value = srcinfo_dependency_value(raw_line[1:], current_filename)
+    for line in iter_diff_lines(text):
+        if line.change_type == "removed":
+            value = srcinfo_dependency_value(line.content, line.filename)
             if value is not None:
                 removed_names.add(dependency_name(value.value))
-            old_line_number += 1
             continue
-        if raw_line.startswith("+") and not raw_line.startswith("+++"):
-            value = srcinfo_dependency_value(raw_line[1:], current_filename, new_line_number)
+        if line.change_type == "added":
+            value = srcinfo_dependency_value(line.content, line.filename, line.line_number)
             if value is not None:
                 added.append(value)
-            new_line_number += 1
-            continue
-        old_line_number += 1
-        new_line_number += 1
 
     findings: list[Finding] = []
     for value in added:

@@ -9,6 +9,7 @@ from aur_diff_sentinel.command_analysis import (
 )
 from aur_diff_sentinel.models import Finding, Severity, SourceLine
 from aur_diff_sentinel.shell_analysis import shell_commands
+from aur_diff_sentinel.source_lines import is_full_line_comment
 
 
 def sequence_findings(lines: list[SourceLine]) -> list[Finding]:
@@ -17,7 +18,7 @@ def sequence_findings(lines: list[SourceLine]) -> list[Finding]:
     seen_temp_package_install: set[tuple[str | None, str | None, str | None, int | None]] = set()
 
     for line in lines:
-        if _is_full_line_comment(line.content):
+        if is_full_line_comment(line.content):
             continue
         block_key = _sequence_block_key(line)
         if line.execution_context not in {"scriptlet", "hook"}:
@@ -185,7 +186,3 @@ def _sequence_block_key(line: SourceLine) -> tuple[str | None, str | None, str |
 
 def _is_hook_exec(content: str) -> bool:
     return re.match(r"^\s*Exec\s*=", content, re.IGNORECASE) is not None
-
-
-def _is_full_line_comment(content: str) -> bool:
-    return content.lstrip().startswith("#")
