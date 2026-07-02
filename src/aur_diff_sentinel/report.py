@@ -159,7 +159,12 @@ def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:
     medium_attention = [
         review
         for review in reviews
-        if _highest_severity(review) in {Severity.MEDIUM, Severity.LOW}
+        if _highest_severity(review) == Severity.MEDIUM
+    ]
+    low_attention = [
+        review
+        for review in reviews
+        if _highest_severity(review) == Severity.LOW
     ]
     no_findings = [review for review in reviews if not review.findings]
 
@@ -173,12 +178,17 @@ def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:
         lines.extend(_format_attention_item(review) for review in medium_attention)
         lines.append("")
 
+    if low_attention:
+        lines.append("Low attention:")
+        lines.extend(_format_attention_item(review) for review in low_attention)
+        lines.append("")
+
     if no_findings:
         lines.append("No findings:")
         lines.extend(f"- {review.update.package}" for review in no_findings)
         lines.append("")
 
-    if high_attention or medium_attention or any(review.notes for review in reviews):
+    if high_attention or medium_attention or low_attention or any(review.notes for review in reviews):
         lines.append("Details:")
         lines.append("")
 

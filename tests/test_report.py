@@ -203,18 +203,25 @@ class ReportTests(unittest.TestCase):
                     update=AurUpdate("medium-pkg", "3.0-1", "3.1-1"),
                     findings=[_finding("install-script", Severity.MEDIUM)],
                 ),
+                PackageReview(
+                    update=AurUpdate("low-pkg", "4.0-1", "4.1-1"),
+                    findings=[_finding("dependency-added", Severity.LOW)],
+                ),
             ]
         )
         report = format_update_review(result)
 
         self.assertLess(report.index("High attention:"), report.index("Medium attention:"))
-        self.assertLess(report.index("Medium attention:"), report.index("No findings:"))
+        self.assertLess(report.index("Medium attention:"), report.index("Low attention:"))
+        self.assertLess(report.index("Low attention:"), report.index("No findings:"))
         self.assertIn("- high-pkg: source domain changed, checksum SKIP added", report)
         self.assertIn("- medium-pkg: install script referenced", report)
+        self.assertIn("- low-pkg: new dependency added", report)
         self.assertIn("- clean-pkg", report)
         self.assertIn("Details:", report)
         self.assertIn("high-pkg: 1.0-1 -> 1.1-1", report)
         self.assertIn("medium-pkg: 3.0-1 -> 3.1-1", report)
+        self.assertIn("low-pkg: 4.0-1 -> 4.1-1", report)
         self.assertNotIn("clean-pkg: 2.0-1 -> 2.1-1", report)
 
     def test_update_report_reason_summary_is_deduplicated_and_capped(self) -> None:
@@ -388,5 +395,4 @@ def _finding(
         old_value=old_value,
         new_value=new_value,
     )
-
 
