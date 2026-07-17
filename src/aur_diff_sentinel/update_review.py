@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Callable
 
 from aur_diff_sentinel.cache import AurCache
-from aur_diff_sentinel.diff_analysis import analyze_metadata_tree_changes
+from aur_diff_sentinel.metadata_diff import analyze_metadata_tree_changes
 from aur_diff_sentinel.models import Finding
 from aur_diff_sentinel.provider import AurUpdate, default_runner, is_aur_package, installed_version
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
@@ -44,11 +44,7 @@ class UpdateReviewResult:
 
     @property
     def findings(self) -> list[Finding]:
-        return [
-            finding
-            for review in self.reviews
-            for finding in review.findings
-        ]
+        return [finding for review in self.reviews for finding in review.findings]
 
     @property
     def has_findings(self) -> bool:
@@ -59,10 +55,7 @@ class UpdateReviewResult:
         return any(review.refresh_blocked for review in self.reviews)
 
 
-def review_updates(
-    updates: list[AurUpdate],
-    cache: AurCache,
-) -> UpdateReviewResult:
+def review_updates(updates: list[AurUpdate], cache: AurCache) -> UpdateReviewResult:
     reviews: list[PackageReview] = []
 
     for update in updates:
@@ -94,18 +87,6 @@ def review_updates(
         reviews.append(review)
 
     return UpdateReviewResult(reviews=reviews)
-
-
-def refresh_cached_reviewed_baselines(
-    cache: AurCache,
-    *,
-    installed_version_getter: InstalledVersionGetter | None = None,
-) -> UpdateReviewResult:
-    return refresh_reviewed_baselines(
-        [],
-        cache,
-        installed_version_getter=installed_version_getter,
-    )
 
 
 def refresh_reviewed_baselines(

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
+from pathlib import PurePosixPath
 
 from aur_diff_sentinel.command_analysis import (
     is_cd_to_non_temp_dir,
@@ -60,10 +62,46 @@ def sequence_findings(lines: list[SourceLine]) -> list[Finding]:
     return findings
 
 
-def with_composite_findings(findings: list[Finding]) -> list[Finding]:
-    findings = _add_suspicious_live_install_sequence(findings)
-    findings = _add_dependency_risk_composite(findings)
-    return findings
+def with_composite_findings(
+    findings: list[Finding],
+    *,
+    filenames: Iterable[str | None] = (),
+) -> list[Finding]:
+    units = review_units((*filenames, *(finding.filename for finding in findings)))
+    added: list[Finding] = []
+    for unit in dict.fromkeys(units[finding.filename] for finding in findings):
+        scoped = [finding for finding in findings if units[finding.filename] == unit]
+        enriched = _add_dependency_risk_composite(
+            _add_suspicious_live_install_sequence(scoped)
+        )
+        added.extend(enriched[len(scoped):])
+    return [*findings, *added]
+
+
+def review_units(filenames: Iterable[str | None]) -> dict[str | None, str | None]:
+    unique_filenames = tuple(dict.fromkeys(filenames))
+    anchors = sorted(
+        {
+            PurePosixPath(filename).parent
+            for filename in unique_filenames
+            if filename is not None
+            and PurePosixPath(filename).name in {"PKGBUILD", ".SRCINFO"}
+        },
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+    units: dict[str | None, str | None] = {}
+    for filename in unique_filenames:
+        if filename is None:
+            units[filename] = None
+            continue
+        path = PurePosixPath(filename)
+        unit = next(
+            (anchor for anchor in anchors if path == anchor or anchor in path.parents),
+            path.parent,
+        )
+        units[filename] = unit.as_posix()
+    return units
 
 
 def _add_suspicious_live_install_sequence(findings: list[Finding]) -> list[Finding]:

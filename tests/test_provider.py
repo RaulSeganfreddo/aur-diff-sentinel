@@ -1,45 +1,14 @@
 from __future__ import annotations
 
-import io
-import os
 import subprocess
-import sys
-import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
-from unittest.mock import patch
 
-from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
-from aur_diff_sentinel.cache import AurCache, metadata_version, unified_diff_dirs
-from aur_diff_sentinel.cli import run
-from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import (
     AurUpdate,
-    InstalledPackageStatus,
     discover_updates,
     is_aur_package,
     parse_update_output,
     query_installed_package,
-)
-from aur_diff_sentinel.report import format_findings, format_update_review
-from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
-from aur_diff_sentinel.update_review import (
-    PackageReview,
-    UpdateReviewResult,
-    refresh_cached_reviewed_baselines,
-    refresh_reviewed_baselines,
-    review_updates,
-)
-
-from tests.helpers import (
-    SAMPLES,
-    copy_repo_fetcher,
-    finding as _finding,
-    fixture_fetcher,
-    rule_ids,
-    run_git,
-    write_metadata,
 )
 
 class ProviderTests(unittest.TestCase):
@@ -176,5 +145,4 @@ class ProviderTests(unittest.TestCase):
             return subprocess.CompletedProcess([], 0, "Repository : extra\nName : foo-git\n", "")
 
         self.assertTrue(is_aur_package("foo-git", runner=runner))
-
 

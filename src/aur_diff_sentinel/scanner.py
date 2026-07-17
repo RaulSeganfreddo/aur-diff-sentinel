@@ -1,17 +1,20 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Collection, Iterable, Sequence
+from dataclasses import replace
 
 from aur_diff_sentinel.correlation import sequence_findings, with_composite_findings
 from aur_diff_sentinel.diff_analysis import analyze_source_diff
 from aur_diff_sentinel.models import Finding, Rule, SourceLine
 from aur_diff_sentinel.pkgbuild_analysis import analyze_pkgbuild_checksums
 from aur_diff_sentinel.rules import RULES
+from aur_diff_sentinel.shell_analysis import strip_unquoted_comment
 from aur_diff_sentinel.source_lines import (
     is_full_line_comment,
     source_lines_from_diff,
     source_lines_from_text,
 )
+from aur_diff_sentinel.unified_diff import iter_diff_files
 
 
 def scan_lines(
@@ -23,8 +26,11 @@ def scan_lines(
     for line in lines:
         if is_full_line_comment(line.content):
             continue
+        code = strip_unquoted_comment(line.content)
+        regex_line = line if code == line.content else replace(line, content=code)
         for rule in rules:
-            if rule.matches(line):
+            candidate = line if rule.matcher is not None else regex_line
+            if rule.matches(candidate):
                 findings.append(
                     Finding(
                         rule_id=rule.id,
@@ -60,14 +66,14 @@ def scan_text(
     if include_contextual:
         findings.extend(sequence_findings(lines))
         findings.extend(analyze_pkgbuild_checksums(text, filename=filename))
-        findings = with_composite_findings(findings)
-    return _sort_findings_by_source_order(findings)
+        findings = with_composite_findings(findings, filenames=(filename,))
+    return _sort_findings(findings)
 
 
-def _sort_findings_by_source_order(findings: list[Finding]) -> list[Finding]:
+def _sort_findings(findings: list[Finding]) -> list[Finding]:
     ordered = sorted(
         enumerate(findings),
-        key=lambda item: (item[1].line_number, item[0]),
+        key=lambda item: (item[1].filename or "", item[1].line_number, item[0]),
     )
     return [finding for _index, finding in ordered]
 
@@ -102,5 +108,8 @@ def scan_diff_text(
     ]
     findings = [*filtered_line_findings, *diff_findings]
     if include_contextual:
-        findings = with_composite_findings(findings)
-    return findings
+        findings = with_composite_findings(
+            findings,
+            filenames=(file.filename for file in iter_diff_files(text)),
+        )
+    return _sort_findings(findings)

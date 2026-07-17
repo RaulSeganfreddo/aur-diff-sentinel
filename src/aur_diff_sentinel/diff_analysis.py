@@ -7,7 +7,7 @@ from aur_diff_sentinel.dependency_diff import (
     find_dependency_changes,
     find_srcinfo_dependency_changes,
 )
-from aur_diff_sentinel.metadata_diff import analyze_metadata_tree_changes, find_added_metadata_files
+from aur_diff_sentinel.metadata_diff import find_added_metadata_files
 from aur_diff_sentinel.models import Finding
 from aur_diff_sentinel.pkgbuild_diff_parser import collect_diff_arrays
 from aur_diff_sentinel.source_checksum_diff import (
@@ -25,15 +25,15 @@ def analyze_source_diff(
     is_aur_package: Callable[[str], bool] | None = None,
 ) -> list[Finding]:
     arrays = collect_diff_arrays(text)
-    findings: list[Finding] = []
+    findings: list[Finding] = find_added_metadata_files(text)
 
-    findings.extend(find_added_metadata_files(text))
-    findings.extend(compare_source_urls(arrays.removed_values, arrays.added_values))
-    findings.extend(find_removed_checksum_arrays(arrays))
-    findings.extend(find_checksum_algorithm_weakening(arrays))
-    findings.extend(find_checksum_count_mismatches(arrays))
-    findings.extend(find_added_checksum_skips(arrays))
-    findings.extend(find_dependency_changes(arrays, is_aur_package=is_aur_package))
+    for scoped_arrays in arrays.by_filename():
+        findings.extend(compare_source_urls(scoped_arrays.removed_values, scoped_arrays.added_values))
+        findings.extend(find_removed_checksum_arrays(scoped_arrays))
+        findings.extend(find_checksum_algorithm_weakening(scoped_arrays))
+        findings.extend(find_checksum_count_mismatches(scoped_arrays))
+        findings.extend(find_added_checksum_skips(scoped_arrays))
+        findings.extend(find_dependency_changes(scoped_arrays, is_aur_package=is_aur_package))
     findings.extend(
         dedupe_srcinfo_dependency_findings(
             findings,
@@ -42,6 +42,3 @@ def analyze_source_diff(
     )
 
     return findings
-
-
-__all__ = ["analyze_metadata_tree_changes", "analyze_source_diff"]

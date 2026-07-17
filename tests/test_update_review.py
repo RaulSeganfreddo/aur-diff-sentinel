@@ -1,42 +1,20 @@
 from __future__ import annotations
 
-import io
-import os
-import subprocess
-import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
 
-from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
 from aur_diff_sentinel.cache import AurCache, metadata_version, unified_diff_dirs
-from aur_diff_sentinel.cli import run
-from aur_diff_sentinel.models import Finding, Severity
-from aur_diff_sentinel.provider import (
-    AurUpdate,
-    InstalledPackageStatus,
-    discover_updates,
-    parse_update_output,
-    query_installed_package,
-)
-from aur_diff_sentinel.report import format_findings, format_update_review
-from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
+from aur_diff_sentinel.provider import AurUpdate
+from aur_diff_sentinel.report import format_update_review
+from aur_diff_sentinel.scanner import scan_diff_text
 from aur_diff_sentinel.update_review import (
-    PackageReview,
-    UpdateReviewResult,
-    refresh_cached_reviewed_baselines,
     refresh_reviewed_baselines,
     review_updates,
 )
-
 from tests.helpers import (
-    SAMPLES,
     copy_repo_fetcher,
-    finding as _finding,
     fixture_fetcher,
-    rule_ids,
     run_git,
     write_metadata,
 )
@@ -45,6 +23,10 @@ class UpdateWorkflowTests(unittest.TestCase):
     def test_metadata_version_reads_srcinfo_and_pkgbuild_shapes(self) -> None:
         self.assertEqual(metadata_version("pkgver = 1.0\npkgrel = 2\n"), "1.0-2")
         self.assertEqual(metadata_version("pkgver=1.0\npkgrel=2\n"), "1.0-2")
+        self.assertEqual(metadata_version("epoch = 2\npkgver = 1.0\npkgrel = 2\n"), "2:1.0-2")
+        self.assertEqual(metadata_version("epoch='2'\npkgver=1.0\npkgrel=2\n"), "2:1.0-2")
+        self.assertEqual(metadata_version("epoch=0\npkgver=1.0\npkgrel=2\n"), "1.0-2")
+        self.assertIsNone(metadata_version("epoch=$epoch\npkgver=1.0\npkgrel=2\n"))
 
     def test_fetch_latest_rejects_invalid_package_before_fetcher_runs(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -391,6 +373,78 @@ class UpdateWorkflowTests(unittest.TestCase):
             )
             self.assertIn("Initialized review baseline", " ".join(result.reviews[0].notes))
 
+    def test_epoch_package_reconstructs_installed_baseline_commit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            repo = root / "repo"
+            repo.mkdir()
+            run_git(repo, "init")
+            run_git(repo, "config", "user.email", "test@example.invalid")
+            run_git(repo, "config", "user.name", "Test User")
+            (repo / "PKGBUILD").write_text(
+                "pkgname=example-bin\nepoch=2\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+            run_git(repo, "add", "PKGBUILD")
+            run_git(repo, "commit", "-m", "old")
+            (repo / "PKGBUILD").write_text(
+                "pkgname=example-bin\nepoch=2\npkgver=1.1\npkgrel=1\nsha256sums=('abc')\n",
+                encoding="utf-8",
+            )
+            run_git(repo, "commit", "-am", "new")
+
+            update = AurUpdate("example-bin", "2:1.0-1", "2:1.1-1")
+            cache = AurCache(root / "cache", fetcher=copy_repo_fetcher(repo))
+
+            result = review_updates([update], cache)
+
+            self.assertEqual(cache.baseline_version(update.package), "2:1.0-1")
+            self.assertIn(
+                "pkgver=1.0",
+                (cache.baseline_dir(update.package) / "PKGBUILD").read_text(encoding="utf-8"),
+            )
+            self.assertIn("Initialized review baseline", " ".join(result.reviews[0].notes))
+
+    def test_epoch_refresh_requires_the_complete_installed_version(self) -> None:
+        for name, installed, refreshed in (
+            ("exact", "2:1.1-1", True),
+            ("missing-epoch", "1.1-1", False),
+        ):
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                update = AurUpdate("example-bin", "2:1.0-1", "2:1.1-1")
+
+                def fetcher(_update: AurUpdate, target: Path) -> None:
+                    target.mkdir(parents=True)
+                    (target / "PKGBUILD").write_text(
+                        "pkgname=example-bin\nepoch=2\npkgver=1.1\npkgrel=1\nsha256sums=('abc')\n",
+                        encoding="utf-8",
+                    )
+
+                cache = AurCache(root, fetcher=fetcher)
+                baseline = cache.baseline_dir(update.package)
+                baseline.mkdir(parents=True)
+                (baseline / "PKGBUILD").write_text(
+                    "pkgname=example-bin\nepoch=2\npkgver=1.0\npkgrel=1\nsha256sums=('abc')\n",
+                    encoding="utf-8",
+                )
+                (baseline / ".aur-sentinel-baseline-version").write_text(
+                    "2:1.0-1",
+                    encoding="utf-8",
+                )
+
+                result = refresh_reviewed_baselines(
+                    [update],
+                    cache,
+                    installed_version_getter=lambda package: installed,
+                )
+
+                self.assertEqual(result.reviews[0].baseline_refreshed, refreshed)
+                self.assertEqual(
+                    cache.baseline_version(update.package),
+                    "2:1.1-1" if refreshed else "2:1.0-1",
+                )
+
     def test_refresh_baseline_skips_pending_update_not_installed_yet(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
@@ -554,8 +608,8 @@ class UpdateWorkflowTests(unittest.TestCase):
             write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
             write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
 
-            result = refresh_cached_reviewed_baselines(
-                cache,
+            result = refresh_reviewed_baselines(
+                [], cache,
                 installed_version_getter=lambda package: "1.1-1",
             )
 
@@ -573,8 +627,8 @@ class UpdateWorkflowTests(unittest.TestCase):
             write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.0", "1")
             write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
 
-            result = refresh_cached_reviewed_baselines(
-                cache,
+            result = refresh_reviewed_baselines(
+                [], cache,
                 installed_version_getter=lambda package: "1.0-1",
             )
 
@@ -606,8 +660,8 @@ class UpdateWorkflowTests(unittest.TestCase):
             cache = AurCache(Path(temp_dir))
             write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
 
-            result = refresh_cached_reviewed_baselines(
-                cache,
+            result = refresh_reviewed_baselines(
+                [], cache,
                 installed_version_getter=lambda package: "1.1-1",
             )
 
@@ -619,12 +673,10 @@ class UpdateWorkflowTests(unittest.TestCase):
             write_metadata(cache.baseline_dir("example-bin"), "example-bin", "1.1", "1")
             write_metadata(cache.latest_dir("example-bin"), "example-bin", "1.1", "1")
 
-            result = refresh_cached_reviewed_baselines(
-                cache,
+            result = refresh_reviewed_baselines(
+                [], cache,
                 installed_version_getter=lambda package: "1.1-1",
             )
 
             self.assertFalse(result.reviews[0].baseline_refreshed)
             self.assertIn("already matches", result.reviews[0].notes[0])
-
-

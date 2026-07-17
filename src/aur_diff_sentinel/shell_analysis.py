@@ -13,7 +13,7 @@ def shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
     if depth > 2:
         return []
 
-    content = _exec_value(content)
+    content = strip_unquoted_comment(_exec_value(content))
     commands: list[list[str]] = []
     for segment in _split_shell_segments(content):
         tokens = tokens_from_shell_segment(segment)
@@ -26,6 +26,47 @@ def shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
             continue
         commands.append(tokens)
     return commands
+
+
+def shell_pipelines(content: str, *, depth: int = 0) -> list[list[list[str]]]:
+    if depth > 2:
+        return []
+    content = strip_unquoted_comment(_exec_value(content))
+    pipelines: list[list[list[str]]] = []
+    for segments in _split_shell_pipelines(content):
+        commands = [
+            tokens
+            for segment in segments
+            if (tokens := _strip_command_prefix(tokens_from_shell_segment(segment)))
+        ]
+        if commands:
+            pipelines.append(commands)
+        for tokens in commands:
+            payload = _shell_c_payload(tokens)
+            if payload is not None:
+                pipelines.extend(shell_pipelines(payload, depth=depth + 1))
+    return pipelines
+
+
+def strip_unquoted_comment(content: str) -> str:
+    quote: str | None = None
+    escape = False
+    for index, char in enumerate(content):
+        if escape:
+            escape = False
+            continue
+        if char == "\\":
+            escape = True
+            continue
+        if quote is not None:
+            if char == quote:
+                quote = None
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "#" and (index == 0 or content[index - 1].isspace()):
+            return content[:index].rstrip()
+    return content
 
 
 def command_name(token: str) -> str:
@@ -47,7 +88,24 @@ def _exec_value(content: str) -> str:
 
 
 def _split_shell_segments(content: str) -> list[str]:
-    segments: list[str] = []
+    return [segment for segment, _operator in _split_shell_parts(content)]
+
+
+def _split_shell_pipelines(content: str) -> list[list[str]]:
+    pipelines: list[list[str]] = []
+    current: list[str] = []
+    for segment, operator in _split_shell_parts(content):
+        current.append(segment)
+        if operator != "|":
+            pipelines.append(current)
+            current = []
+    if current:
+        pipelines.append(current)
+    return pipelines
+
+
+def _split_shell_parts(content: str) -> list[tuple[str, str | None]]:
+    parts: list[tuple[str, str | None]] = []
     current: list[str] = []
     quote: str | None = None
     escape = False
@@ -77,26 +135,30 @@ def _split_shell_segments(content: str) -> list[str]:
             index += 1
             continue
         if content.startswith("&&", index) or content.startswith("||", index):
-            _append_segment(segments, current)
+            _append_part(parts, current, content[index : index + 2])
             current = []
             index += 2
             continue
         if char in {";", "|"}:
-            _append_segment(segments, current)
+            _append_part(parts, current, char)
             current = []
             index += 1
             continue
         current.append(char)
         index += 1
 
-    _append_segment(segments, current)
-    return segments
+    _append_part(parts, current, None)
+    return parts
 
 
-def _append_segment(segments: list[str], chars: list[str]) -> None:
+def _append_part(
+    parts: list[tuple[str, str | None]],
+    chars: list[str],
+    operator: str | None,
+) -> None:
     segment = "".join(chars).strip()
     if segment:
-        segments.append(segment)
+        parts.append((segment, operator))
 
 
 def _strip_command_prefix(tokens: list[str]) -> list[str]:

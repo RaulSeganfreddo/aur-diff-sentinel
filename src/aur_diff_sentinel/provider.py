@@ -118,12 +118,16 @@ _AUR_NAME_PATTERN = re.compile(
 )
 
 
+def looks_like_aur_package_name(package: str) -> bool:
+    return _AUR_NAME_PATTERN.search(package) is not None
+
+
 def is_aur_package(
     package: str,
     *,
     runner: CommandRunner = default_runner,
 ) -> bool:
-    if _AUR_NAME_PATTERN.search(package):
+    if looks_like_aur_package_name(package):
         return True
     try:
         validate_package_name(package)

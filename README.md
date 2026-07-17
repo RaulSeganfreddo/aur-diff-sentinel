@@ -33,12 +33,15 @@ aur-diff-sentinel PKGBUILD
 aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
 aur-diff-sentinel --diff --verbose update.diff
+aur-diff-sentinel --explain PKGBUILD
+aur-diff-sentinel --diff --explain update.diff
 ```
 
 AUR update workflow:
 
 ```bash
 aur-diff-sentinel updates
+aur-diff-sentinel updates --explain
 paru -Syu
 aur-diff-sentinel baseline refresh
 ```
@@ -97,7 +100,8 @@ aur-diff-sentinel uses conservative regex and lightweight context checks for:
 - network activity inside build functions
 - package manager commands in install scripts and pacman hooks
 - package manager commands run from temporary directories in live-system contexts
-- JavaScript tooling dependencies added to dependency groups in update diffs
+- generic, build-tool, JavaScript-tooling, and likely AUR dependency additions in update diffs
+- dependency moves and removals in `PKGBUILD` and `.SRCINFO` diffs
 - combined live-system install sequences made from multiple review signals
 - obvious writes outside `$pkgdir`
 - newly added source URLs in diffs
@@ -130,9 +134,21 @@ Verdict: manual review strongly recommended.
 Use `--verbose` to include matched source lines and rule hints.
 For source and checksum comparison findings, verbose output also includes old and new values.
 
+Use `--explain` to add concise `What`, `Why`, and `Inspect` guidance for each
+finding without changing the default compact output.
+
 When using `updates`, the output starts with an attention summary so packages
 with high- or medium-severity findings are easy to inspect first. Packages with
 no findings are still listed.
+
+## Development
+
+Install the development extras and run the suite from the repository root:
+
+```bash
+pip install -e ".[dev]"
+.venv/bin/python -m pytest
+```
 
 ## Exit codes
 

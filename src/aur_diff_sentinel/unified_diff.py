@@ -28,24 +28,6 @@ class DiffFile:
 
 
 @dataclass(frozen=True)
-class DiffFileEvent:
-    old_filename: str | None
-    new_filename: str | None
-
-    @property
-    def filename(self) -> str | None:
-        return self.new_filename or self.old_filename
-
-    @property
-    def is_new_file(self) -> bool:
-        return self.old_filename is None and self.new_filename is not None
-
-    @property
-    def is_deleted_file(self) -> bool:
-        return self.old_filename is not None and self.new_filename is None
-
-
-@dataclass(frozen=True)
 class DiffLine:
     diff_line_number: int
     hunk_index: int
@@ -152,7 +134,7 @@ def iter_diff_lines(text: str, *, fallback_filename: str | None = None) -> Itera
         new_line_number += 1
 
 
-def iter_diff_files(text: str) -> Iterator[DiffFileEvent]:
+def iter_diff_files(text: str) -> Iterator[DiffFile]:
     old_filename: str | None = None
 
     for raw_line in text.splitlines():
@@ -163,7 +145,7 @@ def iter_diff_files(text: str) -> Iterator[DiffFileEvent]:
             old_filename = filename_from_diff_header(raw_line)
             continue
         if raw_line.startswith("+++"):
-            yield DiffFileEvent(
+            yield DiffFile(
                 old_filename=old_filename,
                 new_filename=filename_from_diff_header(raw_line),
             )

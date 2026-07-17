@@ -101,11 +101,6 @@ class FunctionContextTracker:
         self.function_name: str | None = None
         self.brace_depth = 0
 
-    def update_filename(self, filename: str | None) -> None:
-        self.filename = filename
-        self.function_name = None
-        self.brace_depth = 0
-
     def annotate(self, content: str) -> tuple[str | None, str | None]:
         if is_full_line_comment(content):
             return self.function_name, self._execution_context(self.function_name)

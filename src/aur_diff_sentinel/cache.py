@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import difflib
 import os
+import re
 import shutil
-import subprocess
-from collections.abc import Callable, Sequence
+import tempfile
+from collections.abc import Callable
 from pathlib import Path
 
 from aur_diff_sentinel.provider import (
@@ -18,6 +19,7 @@ from aur_diff_sentinel.provider import (
 Fetcher = Callable[[AurUpdate, Path], None]
 
 BASELINE_VERSION_FILE = ".aur-sentinel-baseline-version"
+VERSION_FIELD_RE = re.compile(r"^(epoch|pkgver|pkgrel)\s*=\s*(.*?)\s*$")
 
 
 def default_cache_root() -> Path:
@@ -60,10 +62,11 @@ class AurCache:
 
     def fetch_latest(self, update: AurUpdate) -> Path:
         latest_dir = self.latest_dir(update.package)
-        if latest_dir.exists():
-            shutil.rmtree(latest_dir)
-        latest_dir.parent.mkdir(parents=True, exist_ok=True)
-        self.fetcher(update, latest_dir)
+        _replace_tree(
+            latest_dir,
+            self.root,
+            lambda staging: self.fetcher(update, staging),
+        )
         return latest_dir
 
     def has_baseline(self, package: str) -> bool:
@@ -103,20 +106,20 @@ class AurCache:
             return False
 
         baseline_dir = self.baseline_dir(update.package)
-        if baseline_dir.exists():
-            shutil.rmtree(baseline_dir)
-        baseline_dir.parent.mkdir(parents=True, exist_ok=True)
-        snapshot_commit(latest_dir, commit, baseline_dir, runner=self.runner)
-        (baseline_dir / BASELINE_VERSION_FILE).write_text(update.old_version, encoding="utf-8")
+        def populate(staging: Path) -> None:
+            snapshot_commit(latest_dir, commit, staging, runner=self.runner)
+            (staging / BASELINE_VERSION_FILE).write_text(update.old_version, encoding="utf-8")
+
+        _replace_tree(baseline_dir, self.root, populate)
         return True
 
     def refresh_baseline(self, update: AurUpdate, latest_dir: Path) -> None:
         baseline_dir = self.baseline_dir(update.package)
-        if baseline_dir.exists():
-            shutil.rmtree(baseline_dir)
-        baseline_dir.parent.mkdir(parents=True, exist_ok=True)
-        copy_metadata_tree(latest_dir, baseline_dir)
-        (baseline_dir / BASELINE_VERSION_FILE).write_text(update.new_version, encoding="utf-8")
+        def populate(staging: Path) -> None:
+            copy_metadata_tree(latest_dir, staging)
+            (staging / BASELINE_VERSION_FILE).write_text(update.new_version, encoding="utf-8")
+
+        _replace_tree(baseline_dir, self.root, populate)
 
     def prune_package(self, package: str) -> None:
         for path in (self.baseline_dir(package), self.latest_dir(package)):
@@ -195,23 +198,41 @@ def snapshot_commit(
 
 
 def metadata_version(text: str) -> str | None:
+    epoch: str | None = None
+    epoch_present = False
     pkgver: str | None = None
     pkgrel: str | None = None
 
     for raw_line in text.splitlines():
-        line = raw_line.strip()
-        if line.startswith("pkgver ="):
-            pkgver = line.split("=", maxsplit=1)[1].strip()
-        elif line.startswith("pkgrel ="):
-            pkgrel = line.split("=", maxsplit=1)[1].strip()
-        elif line.startswith("pkgver="):
-            pkgver = line.split("=", maxsplit=1)[1].strip().strip("'\"")
-        elif line.startswith("pkgrel="):
-            pkgrel = line.split("=", maxsplit=1)[1].strip().strip("'\"")
+        match = VERSION_FIELD_RE.match(raw_line.strip())
+        if match is None:
+            continue
+        name, raw_value = match.groups()
+        value = _unquote_metadata_value(raw_value)
+        if name == "epoch":
+            epoch = value
+            epoch_present = True
+        elif name == "pkgver":
+            pkgver = value
+        else:
+            pkgrel = value
 
-    if pkgver and pkgrel:
+    if not pkgver or not pkgrel:
+        return None
+    if not epoch_present:
         return f"{pkgver}-{pkgrel}"
-    return None
+    if epoch is None or not epoch.isdecimal():
+        return None
+    normalized_epoch = int(epoch)
+    prefix = f"{normalized_epoch}:" if normalized_epoch else ""
+    return f"{prefix}{pkgver}-{pkgrel}"
+
+
+def _unquote_metadata_value(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        return value[1:-1]
+    return value
 
 
 def copy_metadata_tree(source: Path, target: Path) -> None:
@@ -304,3 +325,40 @@ def _ensure_path_within(path: Path, root: Path) -> None:
     resolved_root = root.resolve()
     if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
         raise RuntimeError(f"refusing to write outside cache directory: {path}")
+
+
+def _replace_tree(
+    target: Path,
+    root: Path,
+    populate: Callable[[Path], None],
+) -> None:
+    _ensure_path_within(target, root)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
+    staging = work / "new"
+    backup = work / "old"
+    preserve_backup = False
+    try:
+        populate(staging)
+        if not staging.is_dir():
+            raise RuntimeError(f"cache staging tree was not created: {target}")
+        if target.exists() or target.is_symlink():
+            target.rename(backup)
+        try:
+            staging.rename(target)
+        except OSError as exc:
+            if backup.exists() or backup.is_symlink():
+                try:
+                    backup.rename(target)
+                except OSError as rollback_error:
+                    preserve_backup = True
+                    raise RuntimeError(
+                        f"failed to replace cache tree and rollback; backup preserved at {backup}: "
+                        f"{rollback_error}"
+                    ) from exc
+            raise
+    except OSError as exc:
+        raise RuntimeError(f"failed to replace cache tree {target}: {exc}") from exc
+    finally:
+        if not preserve_backup:
+            shutil.rmtree(work, ignore_errors=True)

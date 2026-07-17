@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from urllib.parse import urlparse
 
-from aur_diff_sentinel.diff_findings import array_finding, value_finding
+from aur_diff_sentinel.diff_findings import diff_finding
 from aur_diff_sentinel.models import Finding, Severity
+from aur_diff_sentinel.pkgbuild_analysis import checksum_skip_hint
 from aur_diff_sentinel.pkgbuild_diff_parser import (
     DiffArrays,
     DiffValue,
@@ -11,11 +12,11 @@ from aur_diff_sentinel.pkgbuild_diff_parser import (
     is_checksum,
     is_checksum_array,
     is_source_url,
-    is_vcs_source,
     old_checksum_value,
     source_arrays_by_suffix,
     source_for_checksum_value,
 )
+from aur_diff_sentinel.pkgbuild_syntax import array_suffix, is_vcs_source, source_without_alias
 
 
 CHECKSUM_STRENGTH = {
@@ -33,58 +34,88 @@ def compare_source_urls(
     removed: list[DiffValue],
     added: list[DiffValue],
 ) -> list[Finding]:
-    old_urls = [value for value in removed if is_source_url(value)]
-    new_urls = [value for value in added if is_source_url(value)]
     findings: list[Finding] = []
+    old_groups = _source_url_groups(removed)
+    new_groups = _source_url_groups(added)
 
-    for index, new_url in enumerate(new_urls):
-        old_url = old_urls[index] if index < len(old_urls) else None
-        if old_url is None:
+    for key, new_urls in new_groups.items():
+        old_urls = list(old_groups.get(key, ()))
+        unmatched_new: list[DiffValue] = []
+        for new_url in new_urls:
+            canonical = source_without_alias(new_url.value)
+            match = next(
+                (
+                    index
+                    for index, old_url in enumerate(old_urls)
+                    if source_without_alias(old_url.value) == canonical
+                ),
+                None,
+            )
+            if match is None:
+                unmatched_new.append(new_url)
+            else:
+                old_urls.pop(match)
+
+        paired_count = min(len(old_urls), len(unmatched_new))
+        for old_url, new_url in zip(old_urls[:paired_count], unmatched_new[:paired_count]):
+            _append_url_change_findings(findings, old_url, new_url)
+        for new_url in unmatched_new[paired_count:]:
             findings.append(
-                value_finding(
+                diff_finding(
                     rule_id="source-url-added",
                     severity=Severity.MEDIUM,
                     message="Source URL added",
                     hint="New source URLs should be reviewed before updating.",
-                    value=new_url,
+                    location=new_url,
                     old_value=None,
-                    new_value=new_url.value,
-                )
-            )
-            continue
-
-        old_parsed = urlparse(old_url.value)
-        new_parsed = urlparse(new_url.value)
-        old_domain = old_parsed.netloc.lower()
-        new_domain = new_parsed.netloc.lower()
-
-        if old_parsed.scheme.lower() == "https" and new_parsed.scheme.lower() == "http":
-            findings.append(
-                value_finding(
-                    rule_id="https-to-http-downgrade",
-                    severity=Severity.HIGH,
-                    message="Source URL changed from HTTPS to HTTP",
-                    hint="A transport security downgrade should be reviewed carefully.",
-                    value=new_url,
-                    old_value=old_url.value,
-                    new_value=new_url.value,
-                )
-            )
-
-        if old_domain and new_domain and old_domain != new_domain:
-            findings.append(
-                value_finding(
-                    rule_id="source-domain-changed",
-                    severity=Severity.HIGH,
-                    message=f"Source domain changed from {old_domain} to {new_domain}",
-                    hint="A changed source host can indicate a meaningful upstream or supply-chain change.",
-                    value=new_url,
-                    old_value=old_url.value,
                     new_value=new_url.value,
                 )
             )
 
     return findings
+
+
+def _source_url_groups(values: list[DiffValue]) -> dict[tuple[str | None, str], list[DiffValue]]:
+    groups: dict[tuple[str | None, str], list[DiffValue]] = {}
+    for value in values:
+        if is_source_url(value):
+            groups.setdefault((value.filename, array_suffix(value.name)), []).append(value)
+    return groups
+
+
+def _append_url_change_findings(
+    findings: list[Finding],
+    old_url: DiffValue,
+    new_url: DiffValue,
+) -> None:
+    old_parsed = urlparse(source_without_alias(old_url.value))
+    new_parsed = urlparse(source_without_alias(new_url.value))
+    old_domain = old_parsed.netloc.lower()
+    new_domain = new_parsed.netloc.lower()
+    if old_parsed.scheme.lower() == "https" and new_parsed.scheme.lower() == "http":
+        findings.append(
+            diff_finding(
+                rule_id="https-to-http-downgrade",
+                severity=Severity.HIGH,
+                message="Source URL changed from HTTPS to HTTP",
+                hint="A transport security downgrade should be reviewed carefully.",
+                location=new_url,
+                old_value=old_url.value,
+                new_value=new_url.value,
+            )
+        )
+    if old_domain and new_domain and old_domain != new_domain:
+        findings.append(
+            diff_finding(
+                rule_id="source-domain-changed",
+                severity=Severity.HIGH,
+                message=f"Source domain changed from {old_domain} to {new_domain}",
+                hint="A changed source host can indicate a meaningful upstream or supply-chain change.",
+                location=new_url,
+                old_value=old_url.value,
+                new_value=new_url.value,
+            )
+        )
 
 
 def find_removed_checksum_arrays(arrays: DiffArrays) -> list[Finding]:
@@ -94,15 +125,15 @@ def find_removed_checksum_arrays(arrays: DiffArrays) -> list[Finding]:
     for old_array in arrays.removed:
         if not is_checksum_array(old_array):
             continue
-        if old_array.suffix in new_checksums_by_suffix:
+        if old_array.suffix.lower() in new_checksums_by_suffix:
             continue
         findings.append(
-            array_finding(
+            diff_finding(
                 rule_id="checksum-array-removed",
                 severity=Severity.HIGH,
                 message="Checksum array was removed",
                 hint="Removing checksums weakens source verification and should be reviewed.",
-                array=old_array,
+                location=old_array,
                 old_value=old_array.name,
                 new_value=None,
             )
@@ -129,12 +160,12 @@ def find_checksum_algorithm_weakening(arrays: DiffArrays) -> list[Finding]:
             continue
 
         findings.append(
-            array_finding(
+            diff_finding(
                 rule_id="checksum-algorithm-weakened",
                 severity=Severity.HIGH,
                 message=f"Checksum algorithm changed from {old_array.name} to {new_array.name}",
                 hint="Changing to a weaker checksum algorithm reduces review confidence.",
-                array=new_array,
+                location=new_array,
                 old_value=old_array.name,
                 new_value=new_array.name,
             )
@@ -158,12 +189,12 @@ def find_checksum_count_mismatches(arrays: DiffArrays) -> list[Finding]:
             continue
 
         findings.append(
-            array_finding(
+            diff_finding(
                 rule_id="checksum-count-mismatch",
                 severity=Severity.MEDIUM,
                 message="Source and checksum counts differ",
                 hint="Each source entry should normally have a matching checksum entry.",
-                array=checksum_array,
+                location=checksum_array,
                 old_value=str(len(source_array.values)),
                 new_value=str(len(checksum_array.values)),
             )
@@ -183,21 +214,15 @@ def find_added_checksum_skips(arrays: DiffArrays) -> list[Finding]:
             source_value = source_for_checksum_value(new_value, new_sources_by_suffix)
             severity = Severity.MEDIUM if is_vcs_source(source_value) else Severity.HIGH
             findings.append(
-                value_finding(
+                diff_finding(
                     rule_id="checksum-skip-added",
                     severity=severity,
                     message="Checksum SKIP added",
-                    hint=checksum_skip_hint(severity),
-                    value=new_value,
+                    hint=checksum_skip_hint(severity, added=True),
+                    location=new_value,
                     old_value=old_value,
                     new_value=new_value.value,
                 )
             )
 
     return findings
-
-
-def checksum_skip_hint(severity: Severity) -> str:
-    if severity == Severity.MEDIUM:
-        return "SKIP is common for VCS sources, but the source should still be reviewed."
-    return "A newly skipped checksum weakens source verification."

@@ -2,10 +2,21 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Callable, Hashable, Iterable
+from dataclasses import dataclass, replace
+from typing import TypeVar
 from urllib.parse import urlparse
 
 
 HUNK_HEADER_RE = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@")
+ARRAY_START_RE = re.compile(
+    r"^\s*(source(?:_[a-z0-9_]+)?|depends(?:_[a-z0-9_]+)?|"
+    r"makedepends(?:_[a-z0-9_]+)?|checkdepends(?:_[a-z0-9_]+)?|"
+    r"optdepends(?:_[a-z0-9_]+)?|"
+    r"(?:md5|sha1|sha224|sha256|sha384|sha512|b2)sums(?:_[a-z0-9_]+)?)"
+    r"\s*(\+?=)\s*(.*)$",
+    re.IGNORECASE,
+)
 SOURCE_ARRAY_RE = re.compile(r"^source(?P<suffix>_[a-z0-9_]+)?$", re.IGNORECASE)
 DEPENDENCY_ARRAY_RE = re.compile(
     r"^(?P<group>depends|makedepends|checkdepends|optdepends)(?P<suffix>_[a-z0-9_]+)?$",
@@ -17,6 +28,167 @@ CHECKSUM_ARRAY_RE = re.compile(
 )
 QUOTED_VALUE_RE = re.compile(r"""(['"])(.*?)\1""")
 VCS_PREFIXES = ("git+", "hg+", "svn+", "bzr+")
+ArrayKey = TypeVar("ArrayKey", bound=Hashable)
+
+
+@dataclass(frozen=True)
+class ArrayValue:
+    name: str
+    value: str
+    index: int
+    line_number: int
+    line_content: str
+    filename: str | None = None
+    sign: str = ""
+
+    @property
+    def suffix(self) -> str:
+        return array_suffix(self.name)
+
+
+@dataclass(frozen=True)
+class ParsedArray:
+    name: str
+    operator: str
+    filename: str | None
+    line_number: int
+    line_content: str
+    values: tuple[ArrayValue, ...]
+    sign: str = ""
+    changed: bool = False
+
+    @property
+    def suffix(self) -> str:
+        return array_suffix(self.name)
+
+    @property
+    def checksum_algorithm(self) -> str | None:
+        return checksum_algorithm(self.name)
+
+
+@dataclass
+class _ArrayBlock:
+    name: str
+    operator: str
+    filename: str | None
+    line_number: int
+    line_content: str
+    lines: list[tuple[int, str]]
+    sign: str
+    changed: bool
+
+
+class ArrayCollector:
+    def __init__(self, *, sign: str = "") -> None:
+        self.sign = sign
+        self.active: _ArrayBlock | None = None
+
+    def reset(self) -> None:
+        self.active = None
+
+    def feed(
+        self,
+        content: str,
+        *,
+        line_number: int,
+        filename: str | None,
+        changed: bool,
+    ) -> ParsedArray | None:
+        if self.active is not None:
+            self.active.lines.append((line_number, content))
+            self.active.changed |= changed
+            if has_unquoted_closing_paren(content):
+                return self._finish()
+            return None
+
+        match = ARRAY_START_RE.match(content)
+        if match is None:
+            return None
+        block = _ArrayBlock(
+            name=match.group(1),
+            operator=match.group(2),
+            filename=filename,
+            line_number=line_number,
+            line_content=content,
+            lines=[(line_number, content)],
+            sign=self.sign,
+            changed=changed,
+        )
+        rest = match.group(3)
+        if "(" in rest and not has_unquoted_closing_paren(rest):
+            self.active = block
+            return None
+        return _parsed_array(block)
+
+    def _finish(self) -> ParsedArray:
+        block = self.active
+        if block is None:
+            raise RuntimeError("array collector has no active block")
+        self.active = None
+        return _parsed_array(block)
+
+
+def collect_arrays_from_text(text: str, *, filename: str | None = None) -> list[ParsedArray]:
+    collector = ArrayCollector()
+    arrays: list[ParsedArray] = []
+    for line_number, content in enumerate(text.splitlines(), start=1):
+        array = collector.feed(
+            content,
+            line_number=line_number,
+            filename=filename,
+            changed=True,
+        )
+        if array is not None:
+            arrays.append(array)
+    return arrays
+
+
+def merge_array_assignments(
+    arrays: Iterable[ParsedArray],
+    *,
+    key: Callable[[ParsedArray], ArrayKey],
+) -> dict[ArrayKey, ParsedArray]:
+    merged: dict[ArrayKey, ParsedArray] = {}
+    for array in arrays:
+        array_key = key(array)
+        previous = merged.get(array_key)
+        if array.operator != "+=" or previous is None:
+            merged[array_key] = array
+            continue
+        offset = len(previous.values)
+        appended = tuple(replace(value, index=offset + value.index) for value in array.values)
+        merged[array_key] = replace(array, values=(*previous.values, *appended))
+    return merged
+
+
+def _parsed_array(block: _ArrayBlock) -> ParsedArray:
+    values: list[ArrayValue] = []
+    for line_number, content in block.lines:
+        assignment = ARRAY_START_RE.match(content)
+        value_content = assignment.group(3) if assignment else content
+        value_text = array_value_text(value_content)
+        for token in split_array_values(value_text, quoted_fallback=True) if value_text else ():
+            values.append(
+                ArrayValue(
+                    name=block.name,
+                    value=token,
+                    index=len(values),
+                    line_number=line_number,
+                    line_content=content,
+                    filename=block.filename,
+                    sign=block.sign,
+                )
+            )
+    return ParsedArray(
+        name=block.name,
+        operator=block.operator,
+        filename=block.filename,
+        line_number=block.line_number,
+        line_content=block.line_content,
+        values=tuple(values),
+        sign=block.sign,
+        changed=block.changed,
+    )
 
 
 def filename_from_diff_header(line: str) -> str | None:

@@ -1,316 +1,251 @@
 from __future__ import annotations
 
-import io
-import os
-import subprocess
-import sys
-import tempfile
 import unittest
-from contextlib import redirect_stderr, redirect_stdout
-from pathlib import Path
-from unittest.mock import patch
+from collections.abc import Callable, Iterable
 
-from aur_diff_sentinel.baseline_prune import SelectionError, parse_prune_selection
-from aur_diff_sentinel.cache import AurCache, metadata_version, unified_diff_dirs
-from aur_diff_sentinel.cli import run
 from aur_diff_sentinel.models import Finding, Severity
-from aur_diff_sentinel.provider import (
-    AurUpdate,
-    InstalledPackageStatus,
-    discover_updates,
-    parse_update_output,
-    query_installed_package,
-)
-from aur_diff_sentinel.report import format_findings, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text, source_lines_from_diff, source_lines_from_text
-from aur_diff_sentinel.update_review import (
-    PackageReview,
-    UpdateReviewResult,
-    refresh_cached_reviewed_baselines,
-    refresh_reviewed_baselines,
-    review_updates,
-)
+from tests.helpers import SAMPLES, rule_ids
 
-from tests.helpers import (
-    SAMPLES,
-    copy_repo_fetcher,
-    finding as _finding,
-    fixture_fetcher,
-    rule_ids,
-    run_git,
-    write_metadata,
-)
+
+def lines(*values: str) -> str:
+    return "\n".join(values)
+
+
+def diff(
+    *body: str, filename: str = "PKGBUILD", hunk: str = "@@ -1 +1 @@", new_file: bool = False
+) -> str:
+    return lines(
+        f"diff --git a/{filename} b/{filename}", "--- /dev/null" if new_file else f"--- a/{filename}",
+        f"+++ b/{filename}", hunk, *body,
+    )
+
+
+def findings_with(findings: Iterable[Finding], rule_id: str) -> list[Finding]:
+    return [finding for finding in findings if finding.rule_id == rule_id]
+
 
 class ScannerTests(unittest.TestCase):
-    def test_eval_is_detected(self) -> None:
-        self.assertIn("eval-used", rule_ids('eval "$flags"'))
+    def assert_detected(
+        self, rule_id: str, text: str, *, filename: str | None = None, severity: Severity | None = None
+    ) -> Finding:
+        findings = scan_text(text, filename=filename)
+        finding = next(finding for finding in findings if finding.rule_id == rule_id)
+        if severity is not None:
+            self.assertEqual(finding.severity, severity)
+        return finding
 
-    def test_curl_pipe_shell_is_detected(self) -> None:
-        self.assertIn("curl-pipe-shell", rule_ids("curl https://example.com/install.sh | bash"))
-        self.assertIn("curl-pipe-shell", rule_ids("wget -O- https://example.com/install.sh | sh"))
+    def assert_diff_finding(
+        self, text: str, rule_id: str, *, severity: Severity | None = None,
+        is_aur_package: Callable[[str], bool | None] | None = None,
+    ) -> Finding:
+        findings = scan_diff_text(text, is_aur_package=is_aur_package)
+        matching = findings_with(findings, rule_id)
+        self.assertEqual(len(matching), 1)
+        if severity is not None:
+            self.assertEqual(matching[0].severity, severity)
+        return matching[0]
 
-    def test_checksum_skip_is_detected(self) -> None:
-        self.assertIn("checksum-skip", rule_ids("sha256sums=('SKIP')"))
-
-    def test_setuid_permission_is_detected(self) -> None:
-        self.assertIn("setuid-permission", rule_ids('chmod 4755 "$pkgdir/usr/bin/example"'))
-        self.assertIn("setuid-permission", rule_ids('install -Dm4755 helper "$pkgdir/usr/bin/helper"'))
-
-    def test_install_script_is_detected(self) -> None:
-        self.assertIn("install-script", rule_ids("install=example.install"))
-
-    def test_shell_c_is_detected(self) -> None:
-        self.assertIn("shell-c", rule_ids('bash -c "$generated_command"'))
-        self.assertIn("shell-c", rule_ids('sh -c "echo test"'))
-
-    def test_source_command_is_detected(self) -> None:
-        self.assertIn("source-command", rule_ids("source ./extra.sh"))
-        self.assertIn("source-command", rule_ids('source "$srcdir/extra.sh"'))
-        self.assertIn("source-command", rule_ids(". ./extra.sh"))
-
-    def test_source_metadata_is_not_treated_as_shell_source_command(self) -> None:
-        self.assertNotIn(
-            "source-command",
-            {
-                finding.rule_id
-                for finding in scan_text(
-                    "source = file::https://example.invalid/file",
-                    filename=".SRCINFO",
-                )
-            },
+    def test_basic_rules_are_detected(self) -> None:
+        cases = (
+            ("eval", "eval-used", 'eval "$flags"'),
+            ("curl-pipe", "curl-pipe-shell", "curl https://example.com/install.sh | bash"),
+            ("wget-pipe", "curl-pipe-shell", "wget -O- https://example.com/install.sh | sh"),
+            ("checksum-skip", "checksum-skip", "sha256sums=('SKIP')"),
+            ("chmod-setuid", "setuid-permission", 'chmod 4755 "$pkgdir/usr/bin/example"'),
+            ("install-setuid", "setuid-permission", 'install -Dm4755 helper "$pkgdir/usr/bin/helper"'),
+            ("install-script", "install-script", "install=example.install"),
+            ("bash-c", "shell-c", 'bash -c "$generated_command"'),
+            ("sh-c", "shell-c", 'sh -c "echo test"'),
+            ("source-relative", "source-command", "source ./extra.sh"),
+            ("source-variable", "source-command", 'source "$srcdir/extra.sh"'),
+            ("dot-source", "source-command", ". ./extra.sh"),
         )
-        self.assertNotIn("source-command", rule_ids('source=("https://example.invalid/file")'))
-        self.assertNotIn("source-command", rule_ids('source_x86_64=("https://example.invalid/file")'))
-        self.assertNotIn("source-command", rule_ids('_source="https://example.invalid/file"'))
+        for name, rule_id, text in cases:
+            with self.subTest(name=name):
+                self.assertIn(rule_id, rule_ids(text))
 
-    def test_decoded_pipe_shell_is_detected_as_high(self) -> None:
-        finding = scan_text("base64 -d payload.txt | sh")[0]
+    def test_command_rule_severities(self) -> None:
+        cases = (
+            ("base64", "decoded-pipe-shell", "base64 -d payload.txt | sh", Severity.HIGH),
+            ("xxd", "decoded-pipe-shell", "xxd -r payload.hex | bash", Severity.HIGH),
+            ("openssl", "decoded-pipe-shell", "openssl enc -d -in payload | sh", Severity.HIGH),
+            ("python", "inline-interpreter-command", "python -c 'print(1)'", Severity.MEDIUM),
+            ("perl", "inline-interpreter-command", "perl -e 'print 1'", Severity.MEDIUM),
+            ("awk", "inline-interpreter-command", "awk '{ system($0) }'", Severity.MEDIUM),
+            ("npx", "direct-exec-package-manager", "npx example", Severity.HIGH),
+            ("bunx", "direct-exec-package-manager", "bunx example", Severity.HIGH),
+            ("npm-exec", "direct-exec-package-manager", "npm exec example", Severity.HIGH),
+            ("yarn-dlx", "direct-exec-package-manager", "yarn dlx example", Severity.HIGH),
+            ("pnpm-exec", "direct-exec-package-manager", "pnpm exec example", Severity.HIGH),
+            ("pnpm-dlx", "direct-exec-package-manager", "pnpm dlx example", Severity.HIGH),
+        )
+        for name, rule_id, command, severity in cases:
+            with self.subTest(name=name):
+                self.assert_detected(rule_id, command, severity=severity)
 
-        self.assertEqual(finding.rule_id, "decoded-pipe-shell")
-        self.assertEqual(finding.severity, Severity.HIGH)
-
-    def test_more_decoded_pipe_shell_forms_are_detected_as_high(self) -> None:
-        for command in ("xxd -r payload.hex | bash", "openssl enc -d -in payload | sh"):
-            with self.subTest(command=command):
-                finding = scan_text(command)[0]
-
-                self.assertEqual(finding.rule_id, "decoded-pipe-shell")
-                self.assertEqual(finding.severity, Severity.HIGH)
-
-    def test_standalone_decode_command_is_not_reported_as_high(self) -> None:
+    def test_basic_false_positive_guards(self) -> None:
+        source_cases = (
+            ("srcinfo", "source = file::https://example.invalid/file", ".SRCINFO"),
+            ("source-array", 'source=("https://example.invalid/file")', None),
+            ("arch-source", 'source_x86_64=("https://example.invalid/file")', None),
+            ("private-variable", '_source="https://example.invalid/file"', None),
+        )
+        for name, text, filename in source_cases:
+            with self.subTest(name=name):
+                ids = {finding.rule_id for finding in scan_text(text, filename=filename)}
+                self.assertNotIn("source-command", ids)
         self.assertNotIn("decoded-pipe-shell", rule_ids("xxd -r payload.hex"))
+        self.assertEqual(scan_text('# eval "$flags"\n# curl https://example.com/file | bash'), [])
+        self.assertNotIn("network-in-build", rule_ids('source=("https://example.com/file.tar.gz")'))
 
-    def test_inline_interpreter_command_is_detected_as_medium(self) -> None:
-        for command in ("python -c 'print(1)'", "perl -e 'print 1'", "awk '{ system($0) }'"):
-            with self.subTest(command=command):
-                finding = scan_text(command)[0]
-
-                self.assertEqual(finding.rule_id, "inline-interpreter-command")
-                self.assertEqual(finding.severity, Severity.MEDIUM)
-
-    def test_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    'source=("git+https://example.invalid/project.git")',
-                    "sha256sums=('SKIP')",
-                ]
-            )
-        )
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-
-    def test_aliased_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    'source=("project::git+https://example.invalid/project")',
-                    "sha256sums=('SKIP')",
-                ]
-            )
-        )
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-
-    def test_non_vcs_checksum_skip_is_high_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    'source=("https://example.invalid/project.tar.gz")',
-                    "sha256sums=('SKIP')",
-                ]
-            )
-        )
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.HIGH)
-
-    def test_unknown_source_checksum_skip_stays_high_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text("sha256sums=('SKIP')")
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.HIGH)
-
-    def test_multiline_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
+    def test_checksum_skip_uses_source_context(self) -> None:
+        cases = (
+            (
+                "vcs",
+                lines('source=("git+https://example.invalid/project.git")', "sha256sums=('SKIP')"),
+                Severity.MEDIUM,
+                2,
+            ),
+            (
+                "aliased-vcs",
+                lines('source=("project::git+https://example.invalid/project")', "sha256sums=('SKIP')"),
+                Severity.MEDIUM,
+                2,
+            ),
+            (
+                "archive",
+                lines('source=("https://example.invalid/project.tar.gz")', "sha256sums=('SKIP')"),
+                Severity.HIGH,
+                2,
+            ),
+            ("unknown", "sha256sums=('SKIP')", Severity.HIGH, 1),
+            (
+                "multiline-vcs",
+                lines(
                     "source=(",
                     '  "git+https://example.invalid/project.git"',
                     ")",
                     "sha256sums=(",
                     "  'SKIP'",
                     ")",
-                ]
-            )
-        )
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-        self.assertEqual(finding.line_number, 5)
-
-    def test_arch_specific_vcs_checksum_skip_is_medium_in_full_pkgbuild_scan(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
+                ),
+                Severity.MEDIUM,
+                5,
+            ),
+            (
+                "arch-vcs",
+                lines(
                     'source=("https://example.invalid/common.tar.gz")',
                     "sha256sums=('abc')",
                     'source_x86_64=("git+https://example.invalid/project.git")',
                     "sha256sums_x86_64=('SKIP')",
-                ]
-            )
+                ),
+                Severity.MEDIUM,
+                4,
+            ),
         )
-        finding = next(finding for finding in findings if finding.rule_id == "checksum-skip")
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-
-    def test_full_line_comments_are_ignored(self) -> None:
-        self.assertEqual(scan_text("# eval \"$flags\"\n# curl https://example.com/file | bash"), [])
+        for name, text, severity, line_number in cases:
+            with self.subTest(name=name):
+                finding = self.assert_detected("checksum-skip", text, severity=severity)
+                self.assertEqual(finding.line_number, line_number)
 
     def test_function_context_is_tracked(self) -> None:
-        lines = source_lines_from_text(
-            "\n".join(
-                [
-                    "pkgname=example",
-                    "prepare() {",
-                    "    curl https://example.com/file.tar.gz -o file.tar.gz",
-                    "}",
-                    "pkgver=1.0",
-                    "function package {",
-                    "    install -Dm755 example \"$pkgdir/usr/bin/example\"",
-                    "}",
-                    "pkgrel=1",
-                ]
-            )
+        source = lines(
+            "pkgname=example",
+            "prepare() {",
+            "    curl https://example.com/file.tar.gz -o file.tar.gz",
+            "}",
+            "pkgver=1.0",
+            "function package {",
+            '    install -Dm755 example "$pkgdir/usr/bin/example"',
+            "}",
+            "pkgrel=1",
         )
+        actual = [line.function_name for line in source_lines_from_text(source)]
+        self.assertEqual(actual, [None, "prepare", "prepare", "prepare", None, "package", "package", "package", None])
 
-        self.assertEqual(lines[0].function_name, None)
-        self.assertEqual(lines[1].function_name, "prepare")
-        self.assertEqual(lines[2].function_name, "prepare")
-        self.assertEqual(lines[3].function_name, "prepare")
-        self.assertEqual(lines[4].function_name, None)
-        self.assertEqual(lines[5].function_name, "package")
-        self.assertEqual(lines[6].function_name, "package")
-        self.assertEqual(lines[8].function_name, None)
-
-    def test_network_in_build_is_detected_inside_build_functions(self) -> None:
-        ids = rule_ids(
-            "\n".join(
-                [
+    def test_pkgbuild_contextual_rules_and_guards(self) -> None:
+        cases = (
+            (
+                "network-in-build",
+                lines(
                     "prepare() {",
                     "    curl https://example.com/file.tar.gz -o file.tar.gz",
                     "    git clone https://example.com/repo.git",
                     "    npm install",
                     "}",
-                ]
-            )
-        )
-
-        self.assertIn("network-in-build", ids)
-
-    def test_scriptlet_package_manager_is_detected_with_temp_directory(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "post_install() {{",
-                    "    cd /tmp",
-                    "    bun add lodash js-digest",
-                    "}}",
-                ]
-            ),
-            filename="example.install",
-        )
-        ids = {finding.rule_id for finding in findings}
-
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertIn("temporary-directory-package-install", ids)
-        self.assertEqual(
-            next(finding for finding in findings if finding.rule_id == "scriptlet-package-manager").function_name,
-            "post_install",
-        )
-
-    def test_function_style_scriptlet_is_tracked(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "function post_install {",
-                    "    npm install atomic-lockfile",
-                    "}",
-                ]
-            ),
-            filename="example.install",
-        )
-        finding = next(
-            finding
-            for finding in findings
-            if finding.rule_id == "scriptlet-package-manager"
-        )
-
-        self.assertEqual(finding.function_name, "post_install")
-        self.assertEqual(finding.execution_context, "scriptlet")
-
-    def test_npm_scriptlet_package_manager_is_detected(self) -> None:
-        ids = {
-            finding.rule_id
-            for finding in scan_text(
-                "\n".join(
-                    [
-                        "post_install() {",
-                        "    cd /tmp",
-                        "    npm install atomic-lockfile yargs",
-                        "}",
-                    ]
                 ),
-                filename="example.install",
-            )
-        }
-
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertIn("temporary-directory-package-install", ids)
-
-    def test_pacman_hook_exec_package_manager_is_detected(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "[Action]",
-                    "Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'",
-                ]
+                "network-in-build",
+                True,
             ),
-            filename="example.hook",
+            (
+                "context-ends",
+                lines("prepare() {", "    true", "}", "curl https://example.com/file.tar.gz -o file.tar.gz"),
+                "network-in-build",
+                False,
+            ),
+            (
+                "outside-pkgdir",
+                lines("package() {", "    install -Dm755 example /usr/bin/example", "}"),
+                "writes-outside-pkgdir",
+                True,
+            ),
+            (
+                "inside-pkgdir",
+                lines(
+                    "package() {",
+                    '    install -Dm755 example "$pkgdir/usr/bin/example"',
+                    '    install -Dm644 example.conf "${pkgdir}/etc/example.conf"',
+                    "}",
+                ),
+                "writes-outside-pkgdir",
+                False,
+            ),
         )
-        ids = {finding.rule_id for finding in findings}
+        for name, text, rule_id, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(rule_id in rule_ids(text), expected)
 
-        self.assertIn("pacman-hook-exec", ids)
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertIn("temporary-directory-package-install", ids)
-        self.assertTrue(all(finding.execution_context == "hook" for finding in findings))
+    def test_scriptlet_and_hook_package_manager_context(self) -> None:
+        cases = (
+            (
+                "bun-temp-scriptlet",
+                lines("post_install() {{", "    cd /tmp", "    bun add lodash js-digest", "}}"),
+                "example.install",
+                {"scriptlet-package-manager", "temporary-directory-package-install"},
+            ),
+            (
+                "npm-temp-scriptlet",
+                lines("post_install() {", "    cd /tmp", "    npm install atomic-lockfile yargs", "}"),
+                "example.install",
+                {"scriptlet-package-manager", "temporary-directory-package-install"},
+            ),
+            (
+                "hook",
+                lines("[Action]", "Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'"),
+                "example.hook",
+                {"pacman-hook-exec", "scriptlet-package-manager", "temporary-directory-package-install"},
+            ),
+        )
+        for name, text, filename, expected in cases:
+            with self.subTest(name=name):
+                findings = scan_text(text, filename=filename)
+                self.assertTrue(expected <= {finding.rule_id for finding in findings})
+                context = "hook" if filename.endswith(".hook") else "scriptlet"
+                self.assertTrue(all(finding.execution_context == context for finding in findings))
+        finding = self.assert_detected(
+            "scriptlet-package-manager",
+            lines("function post_install {", "    npm install atomic-lockfile", "}"),
+            filename="example.install",
+        )
+        self.assertEqual((finding.function_name, finding.execution_context), ("post_install", "scriptlet"))
 
-    def test_legitimate_install_script_without_package_manager_is_not_high(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
+    def test_scriptlet_package_manager_false_positive_guards(self) -> None:
+        cases = (
+            (
+                "legitimate-scriptlet",
+                lines(
                     "post_install() {",
                     '    echo "Custom flags belong in ~/.config/example-flags.conf"',
                     "}",
@@ -318,1216 +253,484 @@ class ScannerTests(unittest.TestCase):
                     "post_upgrade() {",
                     "    post_install",
                     "}",
-                ]
+                ),
             ),
-            filename="example.install",
-        )
-
-        self.assertNotIn(
-            "scriptlet-package-manager",
-            {finding.rule_id for finding in findings},
-        )
-        self.assertFalse(any(finding.severity == Severity.HIGH for finding in findings))
-
-    def test_comments_and_strings_do_not_match_package_manager_rules(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "# npm install atomic-lockfile",
-                    'message="run bun add manually"',
-                ]
+            ("comments-and-strings", lines("# npm install atomic-lockfile", 'message="run bun add manually"')),
+            (
+                "assignment-in-scriptlet",
+                lines("post_install() {", '    message="run bun add manually"', "}"),
             ),
-            filename="example.install",
+            ("command-query", lines("post_install() {", "    command -v bun", "}")),
         )
+        for name, text in cases:
+            with self.subTest(name=name):
+                findings = scan_text(text, filename="example.install")
+                self.assertNotIn("scriptlet-package-manager", {finding.rule_id for finding in findings})
+                if name == "legitimate-scriptlet":
+                    self.assertFalse(any(finding.severity == Severity.HIGH for finding in findings))
+                if name == "comments-and-strings":
+                    self.assertEqual(findings, [])
 
-        self.assertEqual(findings, [])
-
-    def test_quoted_assignment_inside_scriptlet_does_not_match_package_manager_rules(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "post_install() {",
-                    '    message="run bun add manually"',
-                    "}",
-                ]
-            ),
-            filename="example.install",
+    def test_scriptlet_diff_context(self) -> None:
+        install_hunk = lines(
+            "--- a/example.install",
+            "+++ b/example.install",
+            "@@ -40,4 +40,5 @@",
+            "     existing_command",
+            "+    npm install suspicious-package",
+            " }",
         )
-
-        self.assertNotIn("scriptlet-package-manager", {finding.rule_id for finding in findings})
-
-    def test_install_file_hunk_without_function_signature_still_uses_scriptlet_context(self) -> None:
-        text = "\n".join(
-            [
-                "--- a/example.install",
-                "+++ b/example.install",
-                "@@ -40,4 +40,5 @@",
-                "     existing_command",
-                "+    npm install suspicious-package",
-                " }",
-            ]
-        )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "scriptlet-package-manager"
-        )
-
+        finding = findings_with(scan_diff_text(install_hunk), "scriptlet-package-manager")[0]
         self.assertIsNone(finding.function_name)
         self.assertEqual(finding.execution_context, "scriptlet")
 
-    def test_custom_install_reference_hunk_uses_scriptlet_context(self) -> None:
-        text = "\n".join(
-            [
-                "--- a/example-deps",
-                "+++ b/example-deps",
-                "@@ -1 +1 @@",
-                "+npm install suspicious-package",
-            ]
+        custom_hunk = lines(
+            "--- a/example-deps",
+            "+++ b/example-deps",
+            "@@ -1 +1 @@",
+            "+npm install suspicious-package",
         )
-        ids = {
-            finding.rule_id
-            for finding in scan_diff_text(text, scriptlet_files={"example-deps"})
-        }
-
+        ids = {finding.rule_id for finding in scan_diff_text(custom_hunk, scriptlet_files={"example-deps"})}
         self.assertIn("scriptlet-package-manager", ids)
 
-    def test_one_line_scriptlet_does_not_leak_function_name_to_following_lines(self) -> None:
+    def test_one_line_scriptlet_does_not_leak_function_name(self) -> None:
         findings = scan_text(
-            "\n".join(
-                [
-                    'post_install() { echo "done"; }',
-                    "npm install suspicious-package",
-                ]
-            ),
+            lines('post_install() { echo "done"; }', "npm install suspicious-package"),
             filename="example.install",
         )
-        package_manager_findings = [
-            finding for finding in findings if finding.rule_id == "scriptlet-package-manager"
-        ]
+        matching = findings_with(findings, "scriptlet-package-manager")
+        self.assertEqual(len(matching), 1)
+        self.assertIsNone(matching[0].function_name)
+        self.assertEqual(matching[0].execution_context, "scriptlet")
 
-        self.assertEqual(len(package_manager_findings), 1)
-        self.assertIsNone(package_manager_findings[0].function_name)
-        self.assertEqual(package_manager_findings[0].execution_context, "scriptlet")
-
-    def test_hook_shell_payload_package_manager_at_start_is_detected(self) -> None:
-        for line in (
-            "Exec = /bin/sh -c 'npm install package'",
-            'Exec=/usr/bin/bash -c "bun add package"',
-        ):
+    def test_hook_shell_payload_variants(self) -> None:
+        for line in ("Exec = /bin/sh -c 'npm install package'", 'Exec=/usr/bin/bash -c "bun add package"'):
             with self.subTest(line=line):
-                ids = {
-                    finding.rule_id
-                    for finding in scan_text(line, filename="example.hook")
-                }
+                ids = {finding.rule_id for finding in scan_text(line, filename="example.hook")}
+                self.assertTrue({"pacman-hook-exec", "scriptlet-package-manager"} <= ids)
 
-                self.assertIn("pacman-hook-exec", ids)
-                self.assertIn("scriptlet-package-manager", ids)
-
-    def test_temp_directory_state_is_cleared_by_later_cd(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "post_install() {",
-                    "    cd /tmp",
-                    "    prepare_something",
-                    "    cd /usr/share/example",
-                    "    npm install package",
-                    "}",
-                ]
+    def test_temporary_directory_tracking(self) -> None:
+        cases = (
+            (
+                "cleared-by-cd",
+                lines("post_install() {", "    cd /tmp", "    prepare_something", "    cd /usr/share/example", "    npm install package", "}"),
+                False,
             ),
-            filename="example.install",
+            ("tmp-subdir", lines("post_install() {", "    cd /tmp/payload", "    npm install package", "}"), True),
+            ("var-tmp-subdir", lines("post_install() {", "    cd /var/tmp/build-dir", "    bun add package", "}"), True),
+            ("cd-after-install", lines("post_install() {", "    npm install package && cd /tmp", "}"), False),
+            (
+                "leave-tmp-before-install",
+                lines("post_install() {", "    cd /tmp && cd /usr/share/example && npm install package", "}"),
+                False,
+            ),
         )
-        ids = {finding.rule_id for finding in findings}
+        for name, text, temporary in cases:
+            with self.subTest(name=name):
+                ids = {finding.rule_id for finding in scan_text(text, filename="example.install")}
+                self.assertIn("scriptlet-package-manager", ids)
+                self.assertEqual("temporary-directory-package-install" in ids, temporary)
 
+        hook = lines("[Action]", "Exec = /bin/sh -c 'cd /tmp'", "Exec = /bin/sh -c 'npm install package'")
+        ids = {finding.rule_id for finding in scan_text(hook, filename="example.hook")}
         self.assertIn("scriptlet-package-manager", ids)
         self.assertNotIn("temporary-directory-package-install", ids)
 
-    def test_temp_directory_subdirectories_are_treated_as_temporary(self) -> None:
-        for command in (
-            "cd /tmp/payload\n    npm install package",
-            "cd /var/tmp/build-dir\n    bun add package",
-        ):
-            with self.subTest(command=command):
-                findings = scan_text(
-                    "\n".join(
-                        [
-                            "post_install() {",
-                            f"    {command}",
-                            "}",
-                        ]
-                    ),
-                    filename="example.install",
-                )
-                ids = {finding.rule_id for finding in findings}
-
-                self.assertIn("scriptlet-package-manager", ids)
-                self.assertIn("temporary-directory-package-install", ids)
-
-    def test_same_line_temp_directory_state_follows_command_order(self) -> None:
-        for command in (
-            "npm install package && cd /tmp",
-            "cd /tmp && cd /usr/share/example && npm install package",
-        ):
-            with self.subTest(command=command):
-                findings = scan_text(
-                    "\n".join(
-                        [
-                            "post_install() {",
-                            f"    {command}",
-                            "}",
-                        ]
-                    ),
-                    filename="example.install",
-                )
-                ids = {finding.rule_id for finding in findings}
-
-                self.assertIn("scriptlet-package-manager", ids)
-                self.assertNotIn("temporary-directory-package-install", ids)
-
-    def test_hook_temp_directory_state_does_not_cross_exec_lines(self) -> None:
-        findings = scan_text(
-            "\n".join(
-                [
-                    "[Action]",
-                    "Exec = /bin/sh -c 'cd /tmp'",
-                    "Exec = /bin/sh -c 'npm install package'",
-                ]
-            ),
-            filename="example.hook",
-        )
-        ids = {finding.rule_id for finding in findings}
-
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertNotIn("temporary-directory-package-install", ids)
-
-    def test_absolute_env_and_command_package_manager_forms_are_detected(self) -> None:
-        ids = {
-            finding.rule_id
-            for finding in scan_text(
-                "\n".join(
-                    [
-                        "post_install() {",
-                        "    cd /tmp && /usr/bin/npm install atomic-lockfile",
-                        "    /usr/bin/bun add js-digest",
-                        "    env npm install atomic-lockfile",
-                        "    command bun add js-digest",
-                        "}",
-                    ]
-                ),
-                filename="example.install",
-            )
-        }
-
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertIn("temporary-directory-package-install", ids)
-
-    def test_env_and_command_options_before_package_manager_are_detected(self) -> None:
-        for command in (
+    def test_package_manager_command_forms(self) -> None:
+        commands = (
             "env HOME=/tmp npm install package",
             "env -i npm install package",
             "env -- npm install package",
             "command -- bun add package",
             "command -p bun add package",
-        ):
+            "npm i package",
+            "bun i package",
+        )
+        for command in commands:
             with self.subTest(command=command):
-                ids = {
-                    finding.rule_id
-                    for finding in scan_text(
-                        "\n".join(
-                            [
-                                "post_install() {",
-                                f"    {command}",
-                                "}",
-                            ]
-                        ),
-                        filename="example.install",
-                    )
-                }
-
-                self.assertIn("scriptlet-package-manager", ids)
-
-    def test_command_query_does_not_match_package_manager_execution(self) -> None:
-        ids = {
-            finding.rule_id
-            for finding in scan_text(
-                "\n".join(
-                    [
-                        "post_install() {",
-                        "    command -v bun",
-                        "}",
-                    ]
-                ),
-                filename="example.install",
-            )
-        }
-
-        self.assertNotIn("scriptlet-package-manager", ids)
-
-    def test_direct_exec_package_managers_are_high(self) -> None:
-        for command in ("npx example", "bunx example", "npm exec example", "yarn dlx example", "pnpm exec example", "pnpm dlx example"):
-            with self.subTest(command=command):
-                finding = next(
-                    finding
-                    for finding in scan_text(command)
-                    if finding.rule_id == "direct-exec-package-manager"
+                text = lines("post_install() {", f"    {command}", "}")
+                self.assertIn(
+                    "scriptlet-package-manager",
+                    {finding.rule_id for finding in scan_text(text, filename="example.install")},
                 )
 
-                self.assertEqual(finding.severity, Severity.HIGH)
-
-    def test_package_manager_aliases_are_detected(self) -> None:
-        for command in ("npm i package", "bun i package"):
-            with self.subTest(command=command):
-                ids = {
-                    finding.rule_id
-                    for finding in scan_text(
-                        "\n".join(
-                            [
-                                "post_install() {",
-                                f"    {command}",
-                                "}",
-                            ]
-                        ),
-                        filename="example.install",
-                    )
-                }
-
-                self.assertIn("scriptlet-package-manager", ids)
-
-    def test_network_in_build_ignores_top_level_sources(self) -> None:
-        ids = rule_ids('source=("https://example.com/file.tar.gz")')
-
-        self.assertNotIn("network-in-build", ids)
-
-    def test_network_in_build_context_ends_after_function(self) -> None:
-        ids = rule_ids(
-            "\n".join(
-                [
-                    "prepare() {",
-                    "    true",
-                    "}",
-                    "curl https://example.com/file.tar.gz -o file.tar.gz",
-                ]
-            )
+        absolute_forms = lines(
+            "post_install() {",
+            "    cd /tmp && /usr/bin/npm install atomic-lockfile",
+            "    /usr/bin/bun add js-digest",
+            "    env npm install atomic-lockfile",
+            "    command bun add js-digest",
+            "}",
         )
+        ids = {finding.rule_id for finding in scan_text(absolute_forms, filename="example.install")}
+        self.assertTrue({"scriptlet-package-manager", "temporary-directory-package-install"} <= ids)
 
-        self.assertNotIn("network-in-build", ids)
-
-    def test_writes_outside_pkgdir_is_detected(self) -> None:
-        ids = rule_ids(
-            "\n".join(
-                [
-                    "package() {",
-                    "    install -Dm755 example /usr/bin/example",
-                    "}",
-                ]
-            )
-        )
-
-        self.assertIn("writes-outside-pkgdir", ids)
-
-    def test_writes_outside_pkgdir_allows_pkgdir_paths(self) -> None:
-        ids = rule_ids(
-            "\n".join(
-                [
-                    "package() {",
-                    "    install -Dm755 example \"$pkgdir/usr/bin/example\"",
-                    "    install -Dm644 example.conf \"${pkgdir}/etc/example.conf\"",
-                    "}",
-                ]
-            )
-        )
-
-        self.assertNotIn("writes-outside-pkgdir", ids)
-
-    def test_clean_input_produces_no_findings(self) -> None:
-        text = (SAMPLES / "clean.PKGBUILD").read_text(encoding="utf-8")
-        self.assertEqual(scan_text(text), [])
-
-    def test_multiple_findings_are_returned(self) -> None:
-        text = (SAMPLES / "suspicious.PKGBUILD").read_text(encoding="utf-8")
-        ids = [finding.rule_id for finding in scan_text(text)]
-
-        self.assertIn("checksum-skip", ids)
-        self.assertIn("eval-used", ids)
-        self.assertIn("setuid-permission", ids)
+    def test_sample_scans(self) -> None:
+        clean = (SAMPLES / "clean.PKGBUILD").read_text(encoding="utf-8")
+        self.assertEqual(scan_text(clean), [])
+        suspicious = (SAMPLES / "suspicious.PKGBUILD").read_text(encoding="utf-8")
+        ids = [finding.rule_id for finding in scan_text(suspicious)]
+        self.assertTrue({"checksum-skip", "eval-used", "setuid-permission"} <= set(ids))
         self.assertGreaterEqual(len(ids), 5)
 
     def test_diff_added_lines_are_scanned(self) -> None:
         text = (SAMPLES / "suspicious.diff").read_text(encoding="utf-8")
         ids = {finding.rule_id for finding in scan_diff_text(text)}
+        self.assertTrue({"checksum-skip-added", "eval-used", "setuid-permission"} <= ids)
 
-        self.assertIn("checksum-skip-added", ids)
-        self.assertIn("eval-used", ids)
-        self.assertIn("setuid-permission", ids)
+    def test_diff_line_metadata(self) -> None:
+        parsed = source_lines_from_diff('+++ b/PKGBUILD\n@@ -1 +1 @@\n+eval "$flags"\n')
+        self.assertEqual(len(parsed), 1)
+        line = parsed[0]
+        self.assertEqual(
+            (line.line_number, line.target_line_number, line.diff_line_number, line.filename, line.change_type, line.content),
+            (1, 1, 3, "PKGBUILD", "added", 'eval "$flags"'),
+        )
 
-    def test_diff_metadata_is_ignored(self) -> None:
-        text = "+++ b/PKGBUILD\n@@ -1 +1 @@\n+eval \"$flags\"\n"
-        lines = source_lines_from_diff(text)
-
-        self.assertEqual(len(lines), 1)
-        self.assertEqual(lines[0].line_number, 1)
-        self.assertEqual(lines[0].target_line_number, 1)
-        self.assertEqual(lines[0].diff_line_number, 3)
-        self.assertEqual(lines[0].filename, "PKGBUILD")
-        self.assertEqual(lines[0].change_type, "added")
-        self.assertEqual(lines[0].content, 'eval "$flags"')
-
-    def test_diff_target_line_numbers_are_tracked(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -10,3 +20,4 @@",
+        parsed = source_lines_from_diff(
+            diff(
                 " context_before",
                 "-old_checksum",
-                "+eval \"$flags\"",
+                '+eval "$flags"',
                 " context_after",
-                "+chmod 4755 \"$pkgdir/usr/bin/example\"",
-            ]
+                '+chmod 4755 "$pkgdir/usr/bin/example"',
+                hunk="@@ -10,3 +20,4 @@",
+            )
         )
-        lines = source_lines_from_diff(text)
-
-        self.assertEqual([line.line_number for line in lines], [21, 23])
-        self.assertEqual([line.target_line_number for line in lines], [21, 23])
-        self.assertEqual([line.diff_line_number for line in lines], [7, 9])
-        self.assertEqual([line.filename for line in lines], ["PKGBUILD", "PKGBUILD"])
+        self.assertEqual([line.line_number for line in parsed], [21, 23])
+        self.assertEqual([line.target_line_number for line in parsed], [21, 23])
+        self.assertEqual([line.diff_line_number for line in parsed], [7, 9])
+        self.assertEqual([line.filename for line in parsed], ["PKGBUILD", "PKGBUILD"])
 
     def test_diff_multi_file_filenames_are_tracked(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "+eval \"$flags\"",
-                "diff --git a/example.install b/example.install",
-                "--- a/example.install",
-                "+++ b/example.install",
-                "@@ -3 +3 @@",
-                "+systemctl start example.service",
-            ]
+        text = lines(
+            diff('+eval "$flags"'),
+            diff("+systemctl start example.service", filename="example.install", hunk="@@ -3 +3 @@"),
         )
         findings = scan_diff_text(text)
-
         self.assertEqual(
             [(finding.filename, finding.line_number, finding.rule_id) for finding in findings],
-            [
-                ("PKGBUILD", 1, "eval-used"),
-                ("example.install", 3, "privilege-command"),
-            ],
+            [("PKGBUILD", 1, "eval-used"), ("example.install", 3, "privilege-command")],
         )
 
-    def test_diff_contextual_rule_uses_visible_function_context(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,3 +1,4 @@",
-                " prepare() {",
-                "+    curl https://example.com/file.tar.gz -o file.tar.gz",
-                " }",
-            ]
+    def test_diff_function_context(self) -> None:
+        contextual = diff(
+            " prepare() {",
+            "+    curl https://example.com/file.tar.gz -o file.tar.gz",
+            " }",
+            hunk="@@ -1,3 +1,4 @@",
         )
-        findings = scan_diff_text(text)
+        finding = self.assert_diff_finding(contextual, "network-in-build")
+        self.assertEqual(finding.function_name, "prepare")
 
-        self.assertIn("network-in-build", {finding.rule_id for finding in findings})
-        self.assertEqual(findings[0].function_name, "prepare")
+        top_level = diff('+source=("https://example.com/file.tar.gz")')
+        self.assertNotIn("network-in-build", {finding.rule_id for finding in scan_diff_text(top_level)})
 
-    def test_diff_contextual_rule_ignores_top_level_source_url(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                '+source=("https://example.com/file.tar.gz")',
-            ]
-        )
-        findings = scan_diff_text(text)
-
-        self.assertNotIn("network-in-build", {finding.rule_id for finding in findings})
-
-    def test_diff_source_change_findings_are_detected(self) -> None:
-        text = (SAMPLES / "source-change.diff").read_text(encoding="utf-8")
-        findings = scan_diff_text(text)
+    def test_source_change_fixture(self) -> None:
+        findings = scan_diff_text((SAMPLES / "source-change.diff").read_text(encoding="utf-8"))
         ids = {finding.rule_id for finding in findings}
+        self.assertTrue({"https-to-http-downgrade", "source-domain-changed", "source-url-added", "checksum-skip-added"} <= ids)
+        finding = findings_with(findings, "source-domain-changed")[0]
+        self.assertEqual(finding.old_value, "https://github.com/example/app/archive/v1.0.tar.gz")
+        self.assertEqual(finding.new_value, "http://downloads.example.net/app/v1.0.tar.gz")
+        self.assertEqual((finding.filename, finding.line_number), ("PKGBUILD", 3))
 
-        self.assertIn("https-to-http-downgrade", ids)
-        self.assertIn("source-domain-changed", ids)
-        self.assertIn("source-url-added", ids)
-        self.assertIn("checksum-skip-added", ids)
-
-    def test_diff_source_change_findings_keep_old_and_new_values(self) -> None:
-        text = (SAMPLES / "source-change.diff").read_text(encoding="utf-8")
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "source-domain-changed"
+    def test_source_diff_parsing_variants(self) -> None:
+        cases = (
+            (
+                "ignore-install-file",
+                diff(
+                    '-source=("https://github.com/example/app.tar.gz")',
+                    '+source=("http://strange.example/app.tar.gz")',
+                    filename="example.install",
+                ),
+                set(),
+                {"source-domain-changed", "https-to-http-downgrade"},
+            ),
+            (
+                "multiline",
+                diff(
+                    " source=(",
+                    '-  "https://github.com/example/app.tar.gz"',
+                    '+  "https://mirror.example/app.tar.gz"',
+                    " )",
+                    hunk="@@ -1,5 +1,5 @@",
+                ),
+                {"source-domain-changed"},
+                set(),
+            ),
+            (
+                "quoted-parentheses",
+                diff(
+                    '-source=("https://old.example/archive.tar.gz")',
+                    '+source=("https://example.org/archive_(x86_64).tar.gz")',
+                ),
+                {"source-domain-changed"},
+                set(),
+            ),
         )
+        for name, text, present, absent in cases:
+            with self.subTest(name=name):
+                findings = scan_diff_text(text)
+                ids = {finding.rule_id for finding in findings}
+                self.assertTrue(present <= ids)
+                self.assertTrue(absent.isdisjoint(ids))
+                if name == "quoted-parentheses":
+                    self.assertEqual(
+                        findings_with(findings, "source-domain-changed")[0].new_value,
+                        "https://example.org/archive_(x86_64).tar.gz",
+                    )
 
-        self.assertEqual(
-            finding.old_value,
-            "https://github.com/example/app/archive/v1.0.tar.gz",
+    def test_checksum_diff_changes(self) -> None:
+        fixture_findings = scan_diff_text((SAMPLES / "checksum-change.diff").read_text(encoding="utf-8"))
+        fixture_ids = {finding.rule_id for finding in fixture_findings}
+        self.assertIn("checksum-algorithm-weakened", fixture_ids)
+        self.assertNotIn("checksum-array-removed", fixture_ids)
+        mismatch = findings_with(fixture_findings, "checksum-count-mismatch")[0]
+        self.assertEqual((mismatch.severity, mismatch.old_value, mismatch.new_value), (Severity.MEDIUM, "2", "1"))
+        self.assertEqual(findings_with(fixture_findings, "checksum-skip-added")[0].severity, Severity.HIGH)
+
+        removed = diff(
+            " pkgname=example",
+            ' source=("https://example.com/app.tar.gz")',
+            "-sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+            " package() {",
+            hunk="@@ -1,4 +1,3 @@",
         )
-        self.assertEqual(
-            finding.new_value,
-            "http://downloads.example.net/app/v1.0.tar.gz",
+        self.assertIn("checksum-array-removed", {finding.rule_id for finding in scan_diff_text(removed)})
+
+        strengthened = diff(
+            " pkgname=example",
+            ' source=("https://example.com/app.tar.gz")',
+            "-md5sums=('abcdef0123456789abcdef0123456789')",
+            "+sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+            hunk="@@ -1,4 +1,4 @@",
         )
-        self.assertEqual(finding.filename, "PKGBUILD")
-        self.assertEqual(finding.line_number, 3)
+        self.assertNotIn("checksum-algorithm-weakened", {finding.rule_id for finding in scan_diff_text(strengthened)})
 
-    def test_diff_source_comparison_ignores_non_pkgbuild_files(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/example.install b/example.install",
-                "--- a/example.install",
-                "+++ b/example.install",
-                "@@ -1 +1 @@",
-                '-source=("https://github.com/example/app.tar.gz")',
-                '+source=("http://strange.example/app.tar.gz")',
-            ]
+        arch = diff(
+            " pkgname=example",
+            ' source=("https://example.com/common.tar.gz")',
+            " sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
+            ' source_x86_64=("https://example.com/bin.tar.gz")',
+            "-sha256sums_x86_64=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
+            "+sha256sums_x86_64=('SKIP')",
+            hunk="@@ -1,7 +1,7 @@",
         )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
+        self.assertNotIn("checksum-count-mismatch", {finding.rule_id for finding in scan_diff_text(arch)})
 
-        self.assertNotIn("source-domain-changed", ids)
-        self.assertNotIn("https-to-http-downgrade", ids)
-
-    def test_diff_multiline_source_arrays_are_compared(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,5 +1,5 @@",
-                " source=(",
-                '-  "https://github.com/example/app.tar.gz"',
-                '+  "https://mirror.example/app.tar.gz"',
-                " )",
-            ]
+    def test_diff_checksum_skip_source_context(self) -> None:
+        cases = (
+            ("vcs", ' source=("git+https://example.com/app.git")'),
+            ("aliased-vcs", ' source=("example::git+https://example.com/app")'),
         )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
-
-        self.assertIn("source-domain-changed", ids)
-
-    def test_diff_removed_checksum_array_is_detected(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,4 +1,3 @@",
-                " pkgname=example",
-                " source=(\"https://example.com/app.tar.gz\")",
-                "-sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
-                " package() {",
-            ]
-        )
-        findings = scan_diff_text(text)
-
-        self.assertIn("checksum-array-removed", {finding.rule_id for finding in findings})
-
-    def test_diff_checksum_algorithm_weakening_is_detected(self) -> None:
-        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
-        findings = scan_diff_text(text)
-        ids = {finding.rule_id for finding in findings}
-
-        self.assertIn("checksum-algorithm-weakened", ids)
-        self.assertNotIn("checksum-array-removed", ids)
-
-    def test_diff_checksum_algorithm_strengthening_is_ignored(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,4 +1,4 @@",
-                " pkgname=example",
-                " source=(\"https://example.com/app.tar.gz\")",
-                "-md5sums=('abcdef0123456789abcdef0123456789')",
-                "+sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
-            ]
-        )
-        findings = scan_diff_text(text)
-
-        self.assertNotIn("checksum-algorithm-weakened", {finding.rule_id for finding in findings})
-
-    def test_diff_checksum_count_mismatch_is_detected(self) -> None:
-        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "checksum-count-mismatch"
-        )
-
-        self.assertEqual(finding.severity.value, "MEDIUM")
-        self.assertEqual(finding.old_value, "2")
-        self.assertEqual(finding.new_value, "1")
-
-    def test_diff_checksum_count_mismatch_matches_arch_suffixes(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,7 +1,7 @@",
-                " pkgname=example",
-                " source=(\"https://example.com/common.tar.gz\")",
-                " sha256sums=('0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef')",
-                " source_x86_64=(\"https://example.com/bin.tar.gz\")",
-                "-sha256sums_x86_64=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
-                "+sha256sums_x86_64=('SKIP')",
-            ]
-        )
-        findings = scan_diff_text(text)
-
-        self.assertNotIn("checksum-count-mismatch", {finding.rule_id for finding in findings})
-
-    def test_diff_vcs_checksum_skip_is_medium_without_duplicate_high(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,4 +1,4 @@",
-                " pkgname=example-git",
-                " source=(\"git+https://example.com/app.git\")",
-                "-sha256sums=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
-                "+sha256sums=('SKIP')",
-            ]
-        )
-        findings = scan_diff_text(text)
-        skip_findings = [finding for finding in findings if "checksum-skip" in finding.rule_id]
-
-        self.assertEqual([finding.rule_id for finding in skip_findings], ["checksum-skip-added"])
-        self.assertEqual(skip_findings[0].severity.value, "MEDIUM")
-
-    def test_diff_aliased_vcs_checksum_skip_is_medium(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,4 +1,4 @@",
-                " pkgname=example-git",
-                " source=(\"example::git+https://example.com/app\")",
-                "-sha256sums=('abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789')",
-                "+sha256sums=('SKIP')",
-            ]
-        )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "checksum-skip-added"
-        )
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-
-    def test_diff_non_vcs_checksum_skip_stays_high(self) -> None:
-        text = (SAMPLES / "checksum-change.diff").read_text(encoding="utf-8")
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "checksum-skip-added"
-        )
-
-        self.assertEqual(finding.severity.value, "HIGH")
-
-    def test_diff_javascript_tooling_dependency_added_is_medium(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=('foo')",
-                "+depends=('foo' 'nodejs')",
-            ]
-        )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "javascript-tooling-dependency-added"
-        )
-
-        self.assertEqual(finding.severity, Severity.MEDIUM)
-        self.assertEqual(finding.new_value, "nodejs")
-
-    def test_diff_unquoted_javascript_tooling_dependency_added_is_detected(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bun)",
-            ]
-        )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "javascript-tooling-dependency-added"
-        )
-
-        self.assertEqual(finding.new_value, "bun")
-
-    def test_diff_multiline_unquoted_javascript_tooling_dependency_added_is_detected(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,4 +1,5 @@",
-                " depends=(",
-                "     foo",
-                "+    bun",
-                " )",
-            ]
-        )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
-
-        self.assertIn("javascript-tooling-dependency-added", ids)
-
-    def test_diff_arch_specific_javascript_tooling_dependency_added_is_detected(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-makedepends_x86_64=(foo)",
-                "+makedepends_x86_64=(foo nodejs)",
-            ]
-        )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "javascript-tooling-dependency-added"
-        )
-
-        self.assertEqual(finding.new_value, "nodejs")
-        self.assertIn("makedepends", finding.message)
-
-    def test_diff_incremental_javascript_tooling_dependency_added_is_detected(self) -> None:
-        for added_line, expected in (
-            ("+depends+=(bun)", "bun"),
-            ("+makedepends_x86_64+=(nodejs)", "nodejs"),
-        ):
-            with self.subTest(added_line=added_line):
-                text = "\n".join(
-                    [
-                        "diff --git a/PKGBUILD b/PKGBUILD",
-                        "--- a/PKGBUILD",
-                        "+++ b/PKGBUILD",
-                        "@@ -1 +1,2 @@",
-                        " depends=(foo)",
-                        added_line,
-                    ]
+        checksum = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        for name, source in cases:
+            with self.subTest(name=name):
+                text = diff(
+                    " pkgname=example-git",
+                    source,
+                    f"-sha256sums=('{checksum}')",
+                    "+sha256sums=('SKIP')",
+                    hunk="@@ -1,4 +1,4 @@",
                 )
-                finding = next(
-                    finding
-                    for finding in scan_diff_text(text)
-                    if finding.rule_id == "javascript-tooling-dependency-added"
-                )
+                findings = scan_diff_text(text)
+                matching = [finding for finding in findings if "checksum-skip" in finding.rule_id]
+                self.assertEqual([finding.rule_id for finding in matching], ["checksum-skip-added"])
+                self.assertEqual(matching[0].severity, Severity.MEDIUM)
 
+    def test_javascript_dependency_syntax_variants(self) -> None:
+        cases = (
+            ("quoted", ("-depends=('foo')", "+depends=('foo' 'nodejs')"), "nodejs", None),
+            ("unquoted", ("-depends=(foo)", "+depends=(foo bun)"), "bun", None),
+            ("multiline", (" depends=(", "     foo", "+    bun", " )"), "bun", None),
+            (
+                "arch-specific",
+                ("-makedepends_x86_64=(foo)", "+makedepends_x86_64=(foo nodejs)"),
+                "nodejs",
+                "makedepends",
+            ),
+            ("incremental", (" depends=(foo)", "+depends+=(bun)"), "bun", None),
+            (
+                "incremental-arch",
+                (" depends=(foo)", "+makedepends_x86_64+=(nodejs)"),
+                "nodejs",
+                "makedepends",
+            ),
+            (
+                "quoted-parentheses",
+                ("-optdepends=(foo)", "+optdepends=('nodejs: optional integration (experimental)' foo)"),
+                "nodejs",
+                None,
+            ),
+        )
+        for name, body, expected, message_part in cases:
+            with self.subTest(name=name):
+                finding = self.assert_diff_finding(diff(*body), "javascript-tooling-dependency-added", severity=Severity.MEDIUM)
                 self.assertEqual(finding.new_value, expected)
+                if message_part:
+                    self.assertIn(message_part, finding.message)
 
-    def test_diff_quoted_parentheses_in_dependency_values_are_preserved(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-optdepends=(foo)",
-                "+optdepends=('nodejs: optional integration (experimental)' foo)",
-            ]
+    def test_dependency_addition_groups(self) -> None:
+        cases = (
+            ("depends", "depends", "foo", "bar"),
+            ("makedepends", "makedepends", "git", "cmake"),
+            ("checkdepends", "checkdepends", "foo", "bar"),
+            ("optdepends", "optdepends", "foo", "bar"),
+            ("arch", "depends_x86_64", "foo", "bar"),
         )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "javascript-tooling-dependency-added"
+        for name, group, existing, added in cases:
+            with self.subTest(name=name):
+                text = diff(f"-{group}=({existing})", f"+{group}=({existing} {added})")
+                finding = self.assert_diff_finding(text, "dependency-added", severity=Severity.LOW)
+                self.assertEqual(finding.new_value, added)
+                self.assertNotIn("javascript-tooling-dependency-added", {item.rule_id for item in scan_diff_text(text)})
+
+    def test_dependency_classification(self) -> None:
+        cases = (
+            ("build-tool", "cargo", "build-tool-dependency-added", Severity.MEDIUM, None),
+            ("aur-heuristic", "bar-git", "aur-dependency-added", Severity.MEDIUM, None),
+            (
+                "aur-callable",
+                "unknown-aur-pkg",
+                "aur-dependency-added",
+                Severity.MEDIUM,
+                lambda package: package == "unknown-aur-pkg",
+            ),
+            (
+                "official-callable",
+                "bash",
+                "dependency-added",
+                Severity.LOW,
+                lambda package: False if package == "bash" else True,
+            ),
         )
+        for name, dependency, rule_id, severity, checker in cases:
+            with self.subTest(name=name):
+                text = diff("-depends=(foo)", f"+depends=(foo {dependency})")
+                finding = self.assert_diff_finding(text, rule_id, severity=severity, is_aur_package=checker)
+                self.assertEqual(finding.new_value, dependency)
 
-        self.assertEqual(finding.new_value, "nodejs")
+        ids = {finding.rule_id for finding in scan_diff_text(diff("-depends=(foo)", "+depends=(foo cargo-git)"))}
+        self.assertIn("aur-dependency-added", ids)
+        self.assertNotIn("build-tool-dependency-added", ids)
 
-    def test_diff_quoted_parentheses_in_source_values_are_preserved(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                '-source=("https://old.example/archive.tar.gz")',
-                '+source=("https://example.org/archive_(x86_64).tar.gz")',
-            ]
+    def test_dependency_moves_and_removals(self) -> None:
+        javascript_move = diff(
+            "-makedepends=('nodejs')",
+            "+makedepends=()",
+            "-depends=('foo')",
+            "+depends=('foo' 'nodejs')",
+            hunk="@@ -1,2 +1,2 @@",
         )
-        finding = next(
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "source-domain-changed"
-        )
-
-        self.assertEqual(finding.new_value, "https://example.org/archive_(x86_64).tar.gz")
-
-    def test_diff_generic_dependency_added_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {finding.rule_id for finding in findings}
-
-        self.assertNotIn("javascript-tooling-dependency-added", ids)
-        self.assertIn("dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.LOW)
-        self.assertEqual(dep_findings[0].new_value, "bar")
-
-    def test_diff_dependency_move_is_not_runtime_addition(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,2 +1,2 @@",
-                "-makedepends=('nodejs')",
-                "+makedepends=()",
-                "-depends=('foo')",
-                "+depends=('foo' 'nodejs')",
-            ]
-        )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
-
+        ids = {finding.rule_id for finding in scan_diff_text(javascript_move)}
         self.assertIn("dependency-moved", ids)
         self.assertNotIn("javascript-tooling-dependency-added", ids)
 
-    def test_diff_srcinfo_dependency_duplicate_is_deduplicated(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=('foo')",
-                "+depends=('foo' 'bun')",
-                "diff --git a/.SRCINFO b/.SRCINFO",
-                "--- a/.SRCINFO",
-                "+++ b/.SRCINFO",
-                "@@ -1 +1,2 @@",
-                " depends = foo",
-                "+depends = bun",
-            ]
+        removed = self.assert_diff_finding(
+            diff("-depends=(foo bar)", "+depends=(foo)"),
+            "dependency-removed",
+            severity=Severity.LOW,
         )
-        findings = [
-            finding
-            for finding in scan_diff_text(text)
-            if finding.rule_id == "javascript-tooling-dependency-added"
-        ]
+        self.assertEqual(removed.old_value, "bar")
 
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].filename, "PKGBUILD")
+        generic_move = diff(
+            "-makedepends=(bar)",
+            "+makedepends=()",
+            "-depends=(foo)",
+            "+depends=(foo bar)",
+            hunk="@@ -1,2 +1,2 @@",
+        )
+        findings = scan_diff_text(generic_move)
+        self.assert_diff_finding(generic_move, "dependency-moved", severity=Severity.LOW)
+        self.assertNotIn("dependency-added", {finding.rule_id for finding in findings})
 
-    def test_diff_bun_campaign_variant_reports_composite_findings(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,2 +1,2 @@",
+    def test_srcinfo_dependency_changes_and_deduplication(self) -> None:
+        cases = (
+            ("generic", "+depends = bar", "dependency-added", "bar", Severity.LOW),
+            ("build-tool", "+makedepends = cargo", "build-tool-dependency-added", "cargo", Severity.MEDIUM),
+            ("aur", "+depends = bar-bin", "aur-dependency-added", "bar-bin", Severity.MEDIUM),
+        )
+        for name, added_line, rule_id, value, severity in cases:
+            with self.subTest(name=name):
+                text = diff(" depends = foo", added_line, filename=".SRCINFO", hunk="@@ -1 +1,2 @@")
+                finding = self.assert_diff_finding(text, rule_id, severity=severity)
+                self.assertEqual(finding.new_value, value)
+
+        for dependency, rule_id in (("bar", "dependency-added"), ("bun", "javascript-tooling-dependency-added")):
+            with self.subTest(deduplicated=dependency):
+                pkgbuild = diff("-depends=('foo')", f"+depends=('foo' '{dependency}')")
+                srcinfo = diff(" depends = foo", f"+depends = {dependency}", filename=".SRCINFO", hunk="@@ -1 +1,2 @@")
+                findings = findings_with(scan_diff_text(lines(pkgbuild, srcinfo)), rule_id)
+                self.assertEqual(len(findings), 1)
+                self.assertEqual(findings[0].filename, "PKGBUILD")
+
+    def test_dependency_risk_correlations(self) -> None:
+        install_change = lines(
+            diff("-depends=(foo)", "+depends=(foo bar)", "-install=", "+install=example.install", hunk="@@ -1,2 +1,2 @@"),
+            diff("+#!/bin/bash", filename="example.install", hunk="@@ -0,0 +1 @@", new_file=True),
+        )
+        findings = scan_diff_text(install_change)
+        ids = {finding.rule_id for finding in findings}
+        self.assertTrue(
+            {"dependency-added", "install-script-added", "aur-metadata-executable-added", "dependency-with-risk-signals"} <= ids
+        )
+        self.assertEqual(findings_with(findings, "dependency-with-risk-signals")[0].severity, Severity.HIGH)
+
+        source_change = diff(
+            "-depends=(foo)",
+            "+depends=(foo bar)",
+            "-source=('https://old.example/file.tar.gz')",
+            "+source=('https://new.example/file.tar.gz')",
+            "-sha256sums=('abc')",
+            "+sha256sums=('def')",
+            hunk="@@ -1,3 +1,3 @@",
+        )
+        findings = scan_diff_text(source_change)
+        ids = {finding.rule_id for finding in findings}
+        self.assertTrue({"dependency-added", "source-domain-changed", "dependency-with-risk-signals"} <= ids)
+        self.assertEqual(findings_with(findings, "dependency-with-risk-signals")[0].severity, Severity.HIGH)
+
+        plain = diff("-depends=(foo)", "+depends=(foo bar)")
+        self.assertNotIn("dependency-with-risk-signals", {finding.rule_id for finding in scan_diff_text(plain)})
+
+    def test_composite_live_install_and_hook_diffs(self) -> None:
+        campaign = lines(
+            diff(
                 "-depends=('pencil')",
                 "+depends=('bun' 'pencil')",
                 "-install=",
                 "+install=pencil-android-lollipop-stencils-git-deps.install",
-                "diff --git a/pencil-android-lollipop-stencils-git-deps.install b/pencil-android-lollipop-stencils-git-deps.install",
-                "--- /dev/null",
-                "+++ b/pencil-android-lollipop-stencils-git-deps.install",
-                "@@ -0,0 +1,4 @@",
+                hunk="@@ -1,2 +1,2 @@",
+            ),
+            diff(
                 "+post_install() {{",
                 "+    cd /tmp",
                 "+    bun add lodash js-digest",
                 "+}}",
-            ]
+                filename="pencil-android-lollipop-stencils-git-deps.install",
+                hunk="@@ -0,0 +1,4 @@",
+                new_file=True,
+            ),
         )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
-
-        self.assertIn("install-script-added", ids)
-        self.assertIn("scriptlet-package-manager", ids)
-        self.assertIn("temporary-directory-package-install", ids)
-        self.assertIn("javascript-tooling-dependency-added", ids)
-        self.assertIn("suspicious-live-install-sequence", ids)
-
-    def test_diff_pacman_hook_file_is_detected(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/example.hook b/example.hook",
-                "--- /dev/null",
-                "+++ b/example.hook",
-                "@@ -0,0 +1,2 @@",
-                "+[Action]",
-                "+Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'",
-            ]
+        ids = {finding.rule_id for finding in scan_diff_text(campaign)}
+        self.assertTrue(
+            {
+                "install-script-added",
+                "scriptlet-package-manager",
+                "temporary-directory-package-install",
+                "javascript-tooling-dependency-added",
+                "suspicious-live-install-sequence",
+            }
+            <= ids
         )
-        ids = {finding.rule_id for finding in scan_diff_text(text)}
 
-        self.assertIn("pacman-hook-added", ids)
-        self.assertIn("pacman-hook-exec", ids)
-        self.assertIn("scriptlet-package-manager", ids)
-
-    def test_diff_dependency_added_in_makedepends_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-makedepends=(git)",
-                "+makedepends=(git cmake)",
-            ]
+        hook = diff(
+            "+[Action]",
+            "+Exec = /bin/sh -c 'cd /tmp && npm install atomic-lockfile semver dotenv'",
+            filename="example.hook",
+            hunk="@@ -0,0 +1,2 @@",
+            new_file=True,
         )
-        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, Severity.LOW)
-        self.assertEqual(findings[0].new_value, "cmake")
-
-    def test_diff_dependency_added_in_checkdepends_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-checkdepends=(foo)",
-                "+checkdepends=(foo bar)",
-            ]
-        )
-        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, Severity.LOW)
-        self.assertEqual(findings[0].new_value, "bar")
-
-    def test_diff_dependency_added_in_optdepends_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-optdepends=(foo)",
-                "+optdepends=(foo bar)",
-            ]
-        )
-        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, Severity.LOW)
-        self.assertEqual(findings[0].new_value, "bar")
-
-    def test_diff_arch_specific_dependency_added_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends_x86_64=(foo)",
-                "+depends_x86_64=(foo bar)",
-            ]
-        )
-        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].severity, Severity.LOW)
-        self.assertEqual(findings[0].new_value, "bar")
-
-    def test_diff_build_tool_dependency_added_is_medium(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo cargo)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("build-tool-dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "build-tool-dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
-        self.assertEqual(dep_findings[0].new_value, "cargo")
-
-    def test_diff_aur_dependency_added_is_medium_via_heuristic(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar-git)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("aur-dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
-        self.assertEqual(dep_findings[0].new_value, "bar-git")
-
-    def test_diff_aur_dependency_added_is_medium_via_callable(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo unknown-aur-pkg)",
-            ]
-        )
-        findings = scan_diff_text(
-            text,
-            is_aur_package=lambda pkg: pkg == "unknown-aur-pkg",
-        )
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("aur-dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
-        self.assertEqual(dep_findings[0].new_value, "unknown-aur-pkg")
-
-    def test_diff_official_dependency_added_is_low_via_callable(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bash)",
-            ]
-        )
-        findings = scan_diff_text(
-            text,
-            is_aur_package=lambda pkg: False if pkg == "bash" else True,
-        )
-        ids = {f.rule_id for f in findings}
-        self.assertNotIn("aur-dependency-added", ids)
-        self.assertIn("dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.LOW)
-        self.assertEqual(dep_findings[0].new_value, "bash")
-
-    def test_diff_aur_heuristic_priority_over_build_tool(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo cargo-git)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("aur-dependency-added", ids)
-        self.assertNotIn("build-tool-dependency-added", ids)
-
-    def test_diff_dependency_with_install_script_is_high(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,2 +1,2 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-                "-install=",
-                "+install=example.install",
-                "diff --git a/example.install b/example.install",
-                "--- /dev/null",
-                "+++ b/example.install",
-                "@@ -0,0 +1 @@",
-                "+#!/bin/bash",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("dependency-added", ids)
-        self.assertIn("install-script-added", ids)
-        self.assertIn("aur-metadata-executable-added", ids)
-        self.assertIn("dependency-with-risk-signals", ids)
-        composite = [f for f in findings if f.rule_id == "dependency-with-risk-signals"]
-        self.assertEqual(len(composite), 1)
-        self.assertEqual(composite[0].severity, Severity.HIGH)
-
-    def test_diff_dependency_with_source_domain_change_is_high(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,3 +1,3 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-                "-source=('https://old.example/file.tar.gz')",
-                "+source=('https://new.example/file.tar.gz')",
-                "-sha256sums=('abc')",
-                "+sha256sums=('def')",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-
-        self.assertIn("dependency-added", ids)
-        self.assertIn("source-domain-changed", ids)
-        self.assertIn("dependency-with-risk-signals", ids)
-        composite = [f for f in findings if f.rule_id == "dependency-with-risk-signals"]
-        self.assertEqual(len(composite), 1)
-        self.assertEqual(composite[0].severity, Severity.HIGH)
-
-    def test_diff_dependency_without_risk_signals_is_not_high(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-            ]
-        )
-        ids = {f.rule_id for f in scan_diff_text(text)}
-        self.assertNotIn("dependency-with-risk-signals", ids)
-
-    def test_diff_srcinfo_dependency_added_is_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/.SRCINFO b/.SRCINFO",
-                "--- a/.SRCINFO",
-                "+++ b/.SRCINFO",
-                "@@ -1,2 +1,3 @@",
-                " depends = foo",
-                " makedepends = git",
-                "+depends = bar",
-            ]
-        )
-        findings = scan_diff_text(text)
-        dep_findings = [f for f in findings if f.rule_id == "dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.LOW)
-        self.assertEqual(dep_findings[0].new_value, "bar")
-
-    def test_diff_srcinfo_dependency_not_duplicated_with_pkgbuild(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-                "diff --git a/.SRCINFO b/.SRCINFO",
-                "--- a/.SRCINFO",
-                "+++ b/.SRCINFO",
-                "@@ -1 +1,2 @@",
-                " depends = foo",
-                "+depends = bar",
-            ]
-        )
-        findings = [f for f in scan_diff_text(text) if f.rule_id == "dependency-added"]
-        self.assertEqual(len(findings), 1)
-        self.assertEqual(findings[0].filename, "PKGBUILD")
-
-    def test_diff_srcinfo_build_tool_dependency_is_medium(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/.SRCINFO b/.SRCINFO",
-                "--- a/.SRCINFO",
-                "+++ b/.SRCINFO",
-                "@@ -1 +1,2 @@",
-                " depends = foo",
-                "+makedepends = cargo",
-            ]
-        )
-        findings = scan_diff_text(text)
-        dep_findings = [f for f in findings if f.rule_id == "build-tool-dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
-        self.assertEqual(dep_findings[0].new_value, "cargo")
-
-    def test_diff_srcinfo_aur_dependency_is_medium(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/.SRCINFO b/.SRCINFO",
-                "--- a/.SRCINFO",
-                "+++ b/.SRCINFO",
-                "@@ -1 +1,2 @@",
-                " depends = foo",
-                "+depends = bar-bin",
-            ]
-        )
-        findings = scan_diff_text(text)
-        dep_findings = [f for f in findings if f.rule_id == "aur-dependency-added"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.MEDIUM)
-        self.assertEqual(dep_findings[0].new_value, "bar-bin")
-
-    def test_diff_dependency_removed_still_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1 +1 @@",
-                "-depends=(foo bar)",
-                "+depends=(foo)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        dep_findings = [f for f in findings if f.rule_id == "dependency-removed"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.LOW)
-        self.assertEqual(dep_findings[0].old_value, "bar")
-
-    def test_diff_dependency_moved_still_low(self) -> None:
-        text = "\n".join(
-            [
-                "diff --git a/PKGBUILD b/PKGBUILD",
-                "--- a/PKGBUILD",
-                "+++ b/PKGBUILD",
-                "@@ -1,2 +1,2 @@",
-                "-makedepends=(bar)",
-                "+makedepends=()",
-                "-depends=(foo)",
-                "+depends=(foo bar)",
-            ]
-        )
-        findings = scan_diff_text(text)
-        ids = {f.rule_id for f in findings}
-        self.assertIn("dependency-moved", ids)
-        self.assertNotIn("dependency-added", ids)
-        dep_findings = [f for f in findings if f.rule_id == "dependency-moved"]
-        self.assertEqual(len(dep_findings), 1)
-        self.assertEqual(dep_findings[0].severity, Severity.LOW)
-
-
+        ids = {finding.rule_id for finding in scan_diff_text(hook)}
+        self.assertTrue({"pacman-hook-added", "pacman-hook-exec", "scriptlet-package-manager"} <= ids)
