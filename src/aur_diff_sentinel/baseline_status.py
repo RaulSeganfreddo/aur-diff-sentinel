@@ -114,10 +114,30 @@ def format_baseline_status(result: BaselineStatusResult) -> str:
         return "\n".join(lines)
 
     _extend_group(lines, "Current:", result.current, _format_current_item)
-    _extend_group(lines, "Ready to refresh:", result.ready_to_refresh, _format_detailed_item)
+    _extend_group(
+        lines,
+        "Ready to refresh:",
+        result.ready_to_refresh,
+        _format_detailed_item,
+        hints=(
+            "To refresh matching installed baselines, run: "
+            "aur-diff-sentinel baseline refresh",
+            "If reviewed findings are intentionally accepted, use: "
+            "aur-diff-sentinel baseline refresh --force",
+        ),
+    )
     _extend_group(lines, "Pending reviewed metadata:", result.pending, _format_pending_item)
     _extend_group(lines, "Installed not reviewed:", result.installed_not_reviewed, _format_detailed_item)
-    _extend_group(lines, "Not installed:", result.not_installed, _format_not_installed_item)
+    _extend_group(
+        lines,
+        "Not installed:",
+        result.not_installed,
+        _format_not_installed_item,
+        hints=(
+            "To remove sentinel cache for packages no longer installed, run: "
+            "aur-diff-sentinel baseline prune",
+        ),
+    )
     _extend_group(lines, "Unknown:", result.unknown, _format_unknown_item)
     _extend_group(lines, "Incomplete cache:", result.incomplete, _format_incomplete_item)
 
@@ -133,11 +153,16 @@ def _extend_group(
     title: str,
     items: list[BaselineStatusItem],
     formatter: Callable[[BaselineStatusItem], str],
+    *,
+    hints: tuple[str, ...] = (),
 ) -> None:
     if not items:
         return
     lines.append(title)
     lines.extend(formatter(item) for item in items)
+    if hints:
+        lines.append("")
+        lines.extend(hints)
     lines.append("")
 
 

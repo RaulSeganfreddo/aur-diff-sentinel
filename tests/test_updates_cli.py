@@ -176,6 +176,8 @@ class UpdatesCliTests(unittest.TestCase):
         self.assertIn("Cached baselines: 0", stdout)
         self.assertIn("No cached baselines found.", stdout)
         self.assertIn("No packages were updated.", stdout)
+        self.assertNotIn("baseline refresh --force", stdout)
+        self.assertNotIn("baseline prune", stdout)
 
     def test_baseline_status_groups_cached_packages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -230,6 +232,16 @@ class UpdatesCliTests(unittest.TestCase):
                 "- ready-pkg: installed 1.1-1, baseline 1.0-1, reviewed 1.1-1",
                 stdout,
             )
+            self.assertIn(
+                "To refresh matching installed baselines, run: "
+                "aur-diff-sentinel baseline refresh",
+                stdout,
+            )
+            self.assertIn(
+                "If reviewed findings are intentionally accepted, use: "
+                "aur-diff-sentinel baseline refresh --force",
+                stdout,
+            )
             self.assertIn("Pending reviewed metadata:", stdout)
             self.assertIn(
                 "- pending-pkg: installed 1.0-1, baseline 1.0-1, reviewed 1.1-1",
@@ -242,11 +254,45 @@ class UpdatesCliTests(unittest.TestCase):
             )
             self.assertIn("Not installed:", stdout)
             self.assertIn("- missing-pkg: baseline 2.0-1, reviewed 2.0-1", stdout)
+            self.assertIn(
+                "To remove sentinel cache for packages no longer installed, run: "
+                "aur-diff-sentinel baseline prune",
+                stdout,
+            )
             self.assertIn("Unknown:", stdout)
             self.assertIn("- unknown-pkg: pacman database error", stdout)
             self.assertIn("Incomplete cache:", stdout)
             self.assertIn("- incomplete-pkg: baseline version could not be determined", stdout)
             self.assertIn("No packages were updated.", stdout)
+
+    def test_baseline_status_omits_action_hints_without_actionable_groups(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            cache = AurCache(root)
+            write_metadata(cache.baseline_dir("current-pkg"), "current-pkg", "1.0", "1")
+            write_metadata(cache.latest_dir("current-pkg"), "current-pkg", "1.0", "1")
+            write_metadata(cache.baseline_dir("unknown-pkg"), "unknown-pkg", "1.0", "1")
+            write_metadata(cache.latest_dir("unknown-pkg"), "unknown-pkg", "1.0", "1")
+
+            def status(package: str) -> InstalledPackageStatus:
+                if package == "current-pkg":
+                    return InstalledPackageStatus(package, version="1.0-1")
+                return InstalledPackageStatus(package, error="pacman database error")
+
+            with patch(
+                "aur_diff_sentinel.baseline_status.query_installed_package",
+                side_effect=status,
+            ):
+                exit_code, stdout, stderr = self.run_cli(
+                    ["baseline", "status", "--cache-dir", str(root)]
+                )
+
+            self.assertEqual(exit_code, 0)
+            self.assertEqual(stderr, "")
+            self.assertIn("Current:", stdout)
+            self.assertIn("Unknown:", stdout)
+            self.assertNotIn("baseline refresh --force", stdout)
+            self.assertNotIn("baseline prune", stdout)
 
     def test_baseline_prune_reports_no_missing_cached_packages(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -374,4 +420,3 @@ class UpdatesCliTests(unittest.TestCase):
             self.assertIn("unknown-pkg: pacman database error", stdout)
             self.assertTrue(cache.baseline_dir("unknown-pkg").exists())
             self.assertTrue(cache.latest_dir("unknown-pkg").exists())
-
