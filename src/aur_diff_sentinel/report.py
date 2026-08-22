@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import re
 from collections import Counter
 
 from aur_diff_sentinel.explanations import EXPLANATIONS, reason_phrase
 from aur_diff_sentinel.models import Finding, Severity
+from aur_diff_sentinel.provider import validate_package_name
 from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult
 
 
 REASON_LIMIT = 3
+_MARKDOWN_ESCAPE_RE = re.compile(r"([\\`*_{}\[\]()<>#!|~])")
 
 
 def format_findings(findings: list[Finding], *, verbose: bool = False, explain: bool = False) -> str:
@@ -119,6 +122,170 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False, e
 
     lines.append("No packages were updated.")
     return "\n".join(lines)
+
+
+def format_review_packet(result: UpdateReviewResult) -> str:
+    """Format a deterministic Markdown aid for manual review of pending updates."""
+    reviews_with_findings = sum(bool(review.findings) for review in result.reviews)
+    incomplete_reviews = sum(bool(review.analysis_errors) for review in result.reviews)
+    highest_severity = next(
+        (
+            severity.value
+            for severity in Severity
+            if any(finding.severity == severity for finding in result.findings)
+        ),
+        "NONE",
+    )
+    lines = [
+        "# aur-diff-sentinel review packet",
+        "",
+        "> This packet is an aid for manual review, not a verdict that a package is safe or malicious.",
+        "",
+        "## Summary",
+        "",
+        f"- **Updates:** {len(result.reviews)}",
+        f"- **Packages with findings:** {reviews_with_findings}",
+        f"- **Incomplete analyses:** {incomplete_reviews}",
+        f"- **Maximum severity:** {highest_severity}",
+        "",
+    ]
+
+    if result.reviews:
+        for review in result.reviews:
+            _append_packet_review(lines, review)
+    else:
+        lines.extend(
+            [
+                "## Packages",
+                "",
+                "No pending AUR updates were found.",
+                "",
+            ]
+        )
+
+    lines.extend(["---", "", "No packages were updated."])
+    return "\n".join(lines)
+
+
+def _append_packet_review(lines: list[str], review: PackageReview) -> None:
+    package = review.update.package
+    validate_package_name(package)
+    severity = _highest_severity(review)
+    lines.extend(
+        [
+            f"## Package: {_escape_markdown(package)}",
+            "",
+            f"- **AUR:** https://aur.archlinux.org/packages/{package}",
+            f"- **Previous version:** {_escape_markdown(review.update.old_version)}",
+            f"- **Candidate version:** {_escape_markdown(review.update.new_version)}",
+            f"- **Analysis:** {'incomplete' if review.analysis_errors else 'complete'}",
+            f"- **Attention:** {severity.value if severity is not None else 'NONE'}",
+            "",
+            "### Notes",
+            "",
+        ]
+    )
+    _append_packet_text_list(lines, review.notes)
+    lines.extend(["### Analysis errors", ""])
+    _append_packet_text_list(lines, review.analysis_errors)
+    lines.extend(["### Findings", ""])
+
+    if review.findings:
+        finding_number = 0
+        for finding_severity in Severity:
+            severity_findings = [
+                finding for finding in review.findings if finding.severity == finding_severity
+            ]
+            if not severity_findings:
+                continue
+            lines.extend([f"#### {finding_severity.value}", ""])
+            for finding in severity_findings:
+                finding_number += 1
+                _append_packet_finding(lines, finding, finding_number)
+    else:
+        lines.extend(
+            [
+                "No configured patterns were detected in the available analysis for this package. "
+                "Manual review is still required.",
+                "",
+            ]
+        )
+
+    lines.extend(["### Files to inspect", ""])
+    filenames = sorted(
+        {finding.filename for finding in review.findings if finding.filename is not None}
+    )
+    if filenames:
+        lines.extend(f"- {_escape_markdown(filename)}" for filename in filenames)
+        lines.append("")
+    else:
+        lines.extend(["None identified from findings.", ""])
+
+    lines.extend(["### Manual review checklist", ""])
+    checklist = _packet_checklist(review.findings)
+    if checklist:
+        lines.extend(f"- {_escape_markdown(item)}" for item in checklist)
+        lines.append("")
+    else:
+        lines.extend(["No rule-specific checklist items were generated.", ""])
+
+
+def _append_packet_text_list(lines: list[str], values: list[str]) -> None:
+    if values:
+        lines.extend(f"- {_escape_markdown(value)}" for value in values)
+        lines.append("")
+    else:
+        lines.extend(["None.", ""])
+
+
+def _append_packet_finding(lines: list[str], finding: Finding, number: int) -> None:
+    lines.extend(
+        [
+            f"**Finding {number}**",
+            "",
+            f"- **Location:** {_escape_markdown(_location(finding))}",
+            f"- **Rule ID:** {_escape_markdown(finding.rule_id)}",
+            f"- **Message:** {_escape_markdown(finding.message)}",
+            "",
+        ]
+    )
+    _append_untrusted_evidence(lines, "Matched line", finding.line_content)
+    if finding.old_value is not None:
+        _append_untrusted_evidence(lines, "Old value", finding.old_value)
+    if finding.new_value is not None:
+        _append_untrusted_evidence(lines, "New value", finding.new_value)
+
+
+def _append_untrusted_evidence(lines: list[str], label: str, value: str) -> None:
+    lines.extend(
+        [
+            f"**{label} (untrusted package-controlled evidence):**",
+            "",
+        ]
+    )
+    evidence_lines = value.splitlines()
+    if not evidence_lines:
+        lines.append("    (empty)")
+    else:
+        lines.extend(f"    {line}" if line else "    (blank line)" for line in evidence_lines)
+    lines.append("")
+
+
+def _packet_checklist(findings: list[Finding]) -> list[str]:
+    checklist: list[str] = []
+    for severity in Severity:
+        for finding in findings:
+            if finding.severity != severity:
+                continue
+            explanation = EXPLANATIONS.get(finding.rule_id)
+            if explanation is not None and explanation.inspect not in checklist:
+                checklist.append(explanation.inspect)
+    return checklist
+
+
+def _escape_markdown(value: str) -> str:
+    normalized = " ".join(value.splitlines())
+    return _MARKDOWN_ESCAPE_RE.sub(r"\\\1", normalized)
 
 
 def _format_cache_refresh_header(result: UpdateReviewResult) -> list[str]:

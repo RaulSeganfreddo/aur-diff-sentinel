@@ -20,14 +20,14 @@ from aur_diff_sentinel.baseline_prune import (
 from aur_diff_sentinel.baseline_status import format_baseline_status, scan_baseline_status
 from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.provider import discover_updates
-from aur_diff_sentinel.report import format_findings, format_update_review
+from aur_diff_sentinel.report import format_findings, format_review_packet, format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text, scan_text
 from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_updates
 
 
 MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] [--explain] PATH
        aur-diff-sentinel --version
-       aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose] [--explain]
+       aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose] [--explain] [--review-packet]
        aur-diff-sentinel baseline refresh [--helper {paru,yay}] [--cache-dir PATH] [--force] [--verbose] [--explain]
        aur-diff-sentinel baseline status [--cache-dir PATH]
        aur-diff-sentinel baseline prune [--cache-dir PATH] [--all]
@@ -47,6 +47,9 @@ scan options:
 
 identity:
   --version         show the installed aur-diff-sentinel version
+
+update output:
+  --review-packet   print a deterministic Markdown review packet
 """
 
 COMMANDS = ("updates", "baseline")
@@ -82,6 +85,11 @@ def build_updates_parser() -> argparse.ArgumentParser:
     _add_helper_option(parser)
     _add_cache_option(parser)
     _add_display_options(parser)
+    parser.add_argument(
+        "--review-packet",
+        action="store_true",
+        help="print a deterministic Markdown review packet",
+    )
     return parser
 
 
@@ -174,6 +182,8 @@ def _run_updates(
 ) -> int:
     parser = build_updates_parser()
     args = parser.parse_args(argv)
+    if args.review_packet and (args.verbose or args.explain):
+        parser.error("--review-packet cannot be combined with --verbose or --explain")
 
     try:
         updates = discover_updates(args.helper)
@@ -182,7 +192,12 @@ def _run_updates(
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
-    print(format_update_review(result, verbose=args.verbose, explain=args.explain), file=stdout)
+    report = (
+        format_review_packet(result)
+        if args.review_packet
+        else format_update_review(result, verbose=args.verbose, explain=args.explain)
+    )
+    print(report, file=stdout)
     if result.analysis_incomplete:
         return 2
     return 1 if result.has_findings else 0

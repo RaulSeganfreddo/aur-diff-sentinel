@@ -45,6 +45,7 @@ AUR update workflow:
 ```bash
 aur-diff-sentinel updates
 aur-diff-sentinel updates --explain
+aur-diff-sentinel updates --review-packet
 paru -Syu
 aur-diff-sentinel baseline refresh
 ```
@@ -149,6 +150,12 @@ finding without changing the default compact output.
 When using `updates`, the output starts with an attention summary so packages
 with high- or medium-severity findings are easy to inspect first. Packages with
 no findings are still listed; skipped metadata is shown as an explicit warning.
+
+Use `updates --review-packet` to print a deterministic Markdown packet for all
+pending updates to standard output. It includes package versions, analysis
+status, findings, untrusted evidence, files identified by findings, and a
+deduplicated manual-review checklist. The packet is a review aid, not a safety
+or malware verdict. It cannot be combined with `--verbose` or `--explain`.
 
 ## Development
 

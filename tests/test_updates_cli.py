@@ -6,8 +6,11 @@ from unittest.mock import patch
 
 from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.cli import run
+from aur_diff_sentinel.models import Severity
 from aur_diff_sentinel.provider import AurUpdate, InstalledPackageStatus
-from tests.helpers import TempRootTestCase, reviewed_cache, write_cached_pair, write_metadata
+from aur_diff_sentinel.report import format_update_review
+from aur_diff_sentinel.update_review import PackageReview, UpdateReviewResult
+from tests.helpers import TempRootTestCase, finding, reviewed_cache, write_cached_pair, write_metadata
 
 
 class UpdatesCliTests(TempRootTestCase):
@@ -45,6 +48,89 @@ class UpdatesCliTests(TempRootTestCase):
                 self.assertIn("No AUR updates found.", stdout)
                 self.assertIn("No packages were updated.", stdout)
 
+    def test_review_packet_zero_updates_returns_markdown_and_zero(self) -> None:
+        with patch("aur_diff_sentinel.cli.discover_updates", return_value=[]):
+            exit_code, stdout, stderr = self.run_cli(["updates", "--review-packet"])
+
+        self.assertEqual((exit_code, stderr), (0, ""))
+        self.assertTrue(stdout.startswith("# aur-diff-sentinel review packet\n"))
+        self.assertIn("- **Updates:** 0", stdout)
+        self.assertIn("No pending AUR updates were found.", stdout)
+        self.assertTrue(stdout.endswith("No packages were updated.\n"))
+
+    def test_review_packet_preserves_findings_and_incomplete_exit_codes(self) -> None:
+        update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+        cases = (
+            (
+                "findings",
+                UpdateReviewResult(
+                    [PackageReview(update, findings=[finding("checksum-skip-added", Severity.HIGH)])]
+                ),
+                1,
+                "checksum-skip-added",
+            ),
+            (
+                "incomplete",
+                UpdateReviewResult(
+                    [PackageReview(update, analysis_errors=["candidate metadata fetch failed: unavailable"])]
+                ),
+                2,
+                "candidate metadata fetch failed: unavailable",
+            ),
+        )
+        for name, result, expected_exit, expected_text in cases:
+            with self.subTest(name=name), patch(
+                "aur_diff_sentinel.cli.discover_updates", return_value=[update]
+            ), patch("aur_diff_sentinel.cli.review_updates", return_value=result) as review:
+                exit_code, stdout, stderr = self.run_cli(["updates", "--review-packet"])
+
+                self.assertEqual((exit_code, stderr), (expected_exit, ""))
+                self.assertIn(expected_text, stdout)
+                review.assert_called_once()
+
+    def test_review_packet_conflicts_with_terminal_detail_modes(self) -> None:
+        for option in ("--verbose", "--explain"):
+            with self.subTest(option=option), patch(
+                "aur_diff_sentinel.cli.discover_updates"
+            ) as discover:
+                exit_code, _stdout, stderr = self.run_cli(
+                    ["updates", "--review-packet", option]
+                )
+
+                self.assertEqual(exit_code, 2)
+                self.assertIn(
+                    "--review-packet cannot be combined with --verbose or --explain",
+                    stderr,
+                )
+                discover.assert_not_called()
+
+    def test_review_packet_scope_does_not_add_deferred_options_or_other_commands(self) -> None:
+        cases = (
+            ["updates", "--output", "review.md"],
+            ["updates", "--min-severity", "medium"],
+            ["tests/samples/clean.PKGBUILD", "--review-packet"],
+            ["baseline", "status", "--review-packet"],
+        )
+        for argv in cases:
+            with self.subTest(argv=argv):
+                exit_code, _stdout, stderr = self.run_cli(argv)
+                self.assertEqual(exit_code, 2)
+                self.assertIn("unrecognized arguments", stderr)
+
+    def test_updates_normal_output_is_unchanged_when_packet_is_not_requested(self) -> None:
+        update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+        result = UpdateReviewResult(
+            [PackageReview(update, findings=[finding("checksum-skip-added", Severity.HIGH)])]
+        )
+        with patch("aur_diff_sentinel.cli.discover_updates", return_value=[update]), patch(
+            "aur_diff_sentinel.cli.review_updates", return_value=result
+        ):
+            exit_code, stdout, stderr = self.run_cli(["updates"])
+
+        self.assertEqual((exit_code, stderr), (1, ""))
+        self.assertEqual(stdout, f"{format_update_review(result)}\n")
+        self.assertNotIn("# aur-diff-sentinel review packet", stdout)
+
     def test_updates_rejects_abbreviated_verbose_flag(self) -> None:
         exit_code, _stdout, stderr = self.run_cli(["updates", "--verbos"])
         self.assertEqual(exit_code, 2)
@@ -63,7 +149,11 @@ class UpdatesCliTests(TempRootTestCase):
 
     def test_help_mentions_update_commands_and_status(self) -> None:
         for name, argv, expected in (
-            ("top-level", ["--help"], ("updates", "baseline refresh", "baseline status", "baseline prune")),
+            (
+                "top-level",
+                ["--help"],
+                ("updates", "baseline refresh", "baseline status", "baseline prune", "--review-packet"),
+            ),
             ("baseline", ["baseline", "--help"], ("status",)),
         ):
             with self.subTest(name=name):
@@ -71,6 +161,12 @@ class UpdatesCliTests(TempRootTestCase):
                 self.assertEqual((exit_code, stderr), (0, ""))
                 for text in expected:
                     self.assertIn(text, stdout)
+
+    def test_updates_help_mentions_review_packet(self) -> None:
+        exit_code, stdout, stderr = self.run_cli(["updates", "--help"])
+
+        self.assertEqual((exit_code, stderr), (0, ""))
+        self.assertIn("--review-packet", stdout)
 
     def test_updates_helper_error_returns_two(self) -> None:
         with patch("aur_diff_sentinel.cli.discover_updates", side_effect=RuntimeError("no helper")):
