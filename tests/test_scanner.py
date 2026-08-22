@@ -13,8 +13,14 @@ def lines(*values: str) -> str:
 
 
 def diff(
-    *body: str, filename: str = "PKGBUILD", hunk: str = "@@ -1 +1 @@", new_file: bool = False
+    *body: str, filename: str = "PKGBUILD", hunk: str | None = None, new_file: bool = False
 ) -> str:
+    if hunk is None:
+        old_count = sum(not line.startswith(("+", "\\")) for line in body)
+        new_count = sum(not line.startswith(("-", "\\")) for line in body)
+        old_start = 0 if old_count == 0 else 1
+        new_start = 0 if new_count == 0 else 1
+        hunk = f"@@ -{old_start},{old_count} +{new_start},{new_count} @@"
     return lines(
         f"diff --git a/{filename} b/{filename}", "--- /dev/null" if new_file else f"--- a/{filename}",
         f"+++ b/{filename}", hunk, *body,

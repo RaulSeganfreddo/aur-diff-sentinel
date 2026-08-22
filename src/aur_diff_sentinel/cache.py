@@ -23,6 +23,10 @@ MAX_METADATA_SCAN_BYTES = 512 * 1024
 VERSION_FIELD_RE = re.compile(r"^(epoch|pkgver|pkgrel)\s*=\s*(.*?)\s*$")
 
 
+class CacheMutationError(RuntimeError):
+    """A cache write or rollback failure that must abort the current operation."""
+
+
 def default_cache_root() -> Path:
     xdg_cache_home = os.environ.get("XDG_CACHE_HOME")
     if xdg_cache_home:
@@ -344,7 +348,7 @@ def _ensure_path_within(path: Path, root: Path) -> None:
     resolved_path = path.resolve()
     resolved_root = root.resolve()
     if resolved_path != resolved_root and resolved_root not in resolved_path.parents:
-        raise RuntimeError(f"refusing to write outside cache directory: {path}")
+        raise CacheMutationError(f"refusing to write outside cache directory: {path}")
 
 
 def _replace_tree(
@@ -354,8 +358,11 @@ def _replace_tree(
 ) -> None:
     """Roll back handled replacement failures; this is not crash- or concurrency-atomic."""
     _ensure_path_within(target, root)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        work = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))
+    except OSError as exc:
+        raise CacheMutationError(f"failed to prepare cache replacement for {target}: {exc}") from exc
     staging = work / "new"
     backup = work / "old"
     preserve_backup = False
@@ -373,13 +380,13 @@ def _replace_tree(
                     backup.rename(target)
                 except OSError as rollback_error:
                     preserve_backup = True
-                    raise RuntimeError(
+                    raise CacheMutationError(
                         f"failed to replace cache tree and rollback; backup preserved at {backup}: "
                         f"{rollback_error}"
                     ) from exc
             raise
     except OSError as exc:
-        raise RuntimeError(f"failed to replace cache tree {target}: {exc}") from exc
+        raise CacheMutationError(f"failed to replace cache tree {target}: {exc}") from exc
     finally:
         if not preserve_backup:
             shutil.rmtree(work, ignore_errors=True)

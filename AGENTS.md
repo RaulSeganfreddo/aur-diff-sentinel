@@ -2,7 +2,7 @@
 
 ## Purpose
 
-`aur-diff-sentinel` is a Python 3.11+ CLI for reviewing AUR PKGBUILDs, metadata diffs, and pending updates. It is a conservative triage tool, not a malware detector: findings identify material for manual review and never prove that a package is safe or malicious.
+`aur-diff-sentinel` is a Python 3.14+ CLI for reviewing AUR PKGBUILDs, metadata diffs, and pending updates. It is a conservative triage tool, not a malware detector: findings identify material for manual review and never prove that a package is safe or malicious.
 
 ## Repository map
 

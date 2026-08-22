@@ -95,6 +95,73 @@ class UnifiedDiffTests(unittest.TestCase):
             ["install-script-added", "pacman-hook-added"],
         )
 
+    def test_header_like_content_inside_hunk_is_not_parsed_as_file_metadata(self) -> None:
+        text = "\n".join(
+            [
+                "--- a/PKGBUILD",
+                "+++ b/PKGBUILD",
+                "@@ -1,2 +1,2 @@",
+                "---removed",
+                "+++added",
+                "--- removed with space",
+                "+++ added with space",
+            ]
+        )
+
+        lines = list(iter_diff_lines(text))
+
+        self.assertEqual(
+            [(line.change_type, line.content) for line in lines],
+            [
+                ("removed", "--removed"),
+                ("added", "++added"),
+                ("removed", "-- removed with space"),
+                ("added", "++ added with space"),
+            ],
+        )
+        self.assertEqual([file.filename for file in iter_diff_files(text)], ["PKGBUILD"])
+
+    def test_hunk_counts_allow_multiple_hunks_and_files_without_git_markers(self) -> None:
+        text = "\n".join(
+            [
+                "--- a/first.install",
+                "+++ b/first.install",
+                "@@ -1 +1 @@",
+                "-old one",
+                "+new one",
+                "@@ -4 +4 @@",
+                "-old two",
+                "+new two",
+                "--- a/second.hook",
+                "+++ b/second.hook",
+                "@@ -0,0 +1 @@",
+                "+new file content",
+            ]
+        )
+
+        lines = list(iter_diff_lines(text))
+
+        self.assertEqual(
+            [file.filename for file in iter_diff_files(text)],
+            ["first.install", "second.hook"],
+        )
+        self.assertEqual(
+            [(line.filename, line.hunk_index, line.content) for line in lines],
+            [
+                ("first.install", 1, "old one"),
+                ("first.install", 1, "new one"),
+                ("first.install", 2, "old two"),
+                ("first.install", 2, "new two"),
+                ("second.hook", 3, "new file content"),
+            ],
+        )
+
+    def test_header_prefixes_without_separator_are_ignored(self) -> None:
+        text = "---not-a-header\n+++not-a-header"
+
+        self.assertEqual(list(iter_diff_files(text)), [])
+        self.assertEqual(list(iter_diff_lines(text)), [])
+
 
 if __name__ == "__main__":
     unittest.main()

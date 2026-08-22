@@ -105,6 +105,34 @@ class UpdatesCliTests(TempRootTestCase):
         self.assertIn("Analysis incomplete.", stdout)
         self.assertNotIn("No findings", stdout)
 
+    def test_updates_fetch_failure_returns_two_after_reporting_complete_batch(self) -> None:
+        updates = [
+            AurUpdate("broken-pkg", "1.0-1", "1.1-1"),
+            AurUpdate("reviewed-pkg", "2.0-1", "2.1-1"),
+        ]
+        cache = AurCache(self.root)
+        write_metadata(cache.baseline_dir("broken-pkg"), "broken-pkg", "1.0", "1")
+        write_metadata(cache.baseline_dir("reviewed-pkg"), "reviewed-pkg", "2.0", "1")
+
+        def fetcher(update: AurUpdate, target) -> None:
+            if update.package == "broken-pkg":
+                raise RuntimeError("temporary fetch failure")
+            write_metadata(target, update.package, "2.1", "1", checksum="SKIP")
+
+        cache.fetcher = fetcher
+        exit_code, stdout, stderr = self.run_review(["updates"], cache, updates)
+
+        self.assertEqual((exit_code, stderr), (2, ""))
+        for text in (
+            "AUR updates found: 2",
+            "broken-pkg: 1.0-1 -> 1.1-1",
+            "candidate metadata fetch failed: temporary fetch failure",
+            "reviewed-pkg: 2.0-1 -> 2.1-1",
+            "checksum-skip-added",
+            "No packages were updated.",
+        ):
+            self.assertIn(text, stdout)
+
     def test_baseline_refresh_blocked_message_mentions_force(self) -> None:
         update, cache = reviewed_cache(self.root, checksum="SKIP")
         exit_code, stdout, stderr = self.run_review(
@@ -117,6 +145,35 @@ class UpdatesCliTests(TempRootTestCase):
         self.assertIn("matching installed baselines were not refreshed", stdout)
         self.assertIn("baseline refresh --force", stdout)
         self.assertIn("No packages were updated.", stdout)
+
+    def test_baseline_refresh_fetch_failure_returns_two_after_partial_refresh(self) -> None:
+        updates = [
+            AurUpdate("broken-pkg", "1.0-1", "1.1-1"),
+            AurUpdate("complete-pkg", "1.0-1", "1.1-1"),
+        ]
+        cache = AurCache(self.root)
+        for update in updates:
+            write_cached_pair(cache, update.package, ("1.0", "1"), ("1.0", "1"))
+
+        def fetcher(update: AurUpdate, target) -> None:
+            if update.package == "broken-pkg":
+                raise RuntimeError("temporary fetch failure")
+            write_metadata(target, update.package, "1.1", "1")
+
+        cache.fetcher = fetcher
+        exit_code, stdout, stderr = self.run_review(
+            ["baseline", "refresh", "--force"],
+            cache,
+            updates,
+            installed="1.1-1",
+        )
+
+        self.assertEqual((exit_code, stderr), (2, ""))
+        self.assertIn("Review baselines refreshed: 1", stdout)
+        self.assertIn("candidate metadata fetch failed: temporary fetch failure", stdout)
+        self.assertIn("complete-pkg: 1.0-1 -> 1.1-1", stdout)
+        self.assertEqual(cache.baseline_version("broken-pkg"), "1.0-1")
+        self.assertEqual(cache.baseline_version("complete-pkg"), "1.1-1")
 
     def test_baseline_refresh_uses_cached_latest_without_pending_updates(self) -> None:
         cache = AurCache(self.root)

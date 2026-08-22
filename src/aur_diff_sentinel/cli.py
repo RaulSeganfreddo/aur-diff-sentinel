@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import difflib
 import sys
+from importlib.metadata import PackageNotFoundError, version as distribution_version
 from pathlib import Path
 from typing import TextIO
 
@@ -25,6 +26,7 @@ from aur_diff_sentinel.update_review import refresh_reviewed_baselines, review_u
 
 
 MAIN_HELP = """usage: aur-diff-sentinel [--diff] [--verbose] [--explain] PATH
+       aur-diff-sentinel --version
        aur-diff-sentinel updates [--helper {paru,yay}] [--cache-dir PATH] [--verbose] [--explain]
        aur-diff-sentinel baseline refresh [--helper {paru,yay}] [--cache-dir PATH] [--force] [--verbose] [--explain]
        aur-diff-sentinel baseline status [--cache-dir PATH]
@@ -42,6 +44,9 @@ scan options:
   --diff            scan only added lines from a unified diff
   --verbose         show matched source lines and rule hints
   --explain         show what, why, and inspect guidance for each finding
+
+identity:
+  --version         show the installed aur-diff-sentinel version
 """
 
 COMMANDS = ("updates", "baseline")
@@ -117,6 +122,9 @@ def run(
     if argv and argv[0] in {"-h", "--help"}:
         print(MAIN_HELP, file=stdout)
         return 0
+    if argv == ["--version"]:
+        print(f"aur-diff-sentinel {_installed_distribution_version()}", file=stdout)
+        return 0
 
     if argv and argv[0] in COMMANDS:
         try:
@@ -188,6 +196,8 @@ def _run_baseline(
     stdin: TextIO,
 ) -> int:
     parser = build_baseline_parser()
+    if "--version" in argv:
+        parser.error("unrecognized arguments: --version")
     args = parser.parse_args(argv)
 
     if args.baseline_command == "status":
@@ -281,6 +291,13 @@ def _looks_like_command_typo(value: str) -> bool:
     if value.startswith("-") or "/" in value or "\\" in value or "." in value:
         return False
     return bool(difflib.get_close_matches(value, COMMANDS, n=1))
+
+
+def _installed_distribution_version() -> str:
+    try:
+        return distribution_version("aur-diff-sentinel")
+    except PackageNotFoundError:
+        return "unknown"
 
 
 if __name__ == "__main__":

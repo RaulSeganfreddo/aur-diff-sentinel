@@ -4,6 +4,8 @@ A small CLI helper for reviewing AUR `PKGBUILD` files and update diffs.
 
 It highlights suspicious or security-relevant patterns so manual review is faster and harder to skim past. It does **not** decide whether a package is safe.
 
+Python 3.14 or later is required.
+
 ## Why this exists
 
 AUR helpers can show long package diffs during updates. Those diffs may contain a
@@ -29,6 +31,7 @@ pip install -e .
 Basic scans:
 
 ```bash
+aur-diff-sentinel --version
 aur-diff-sentinel PKGBUILD
 aur-diff-sentinel --diff update.diff
 aur-diff-sentinel --verbose PKGBUILD
@@ -49,10 +52,15 @@ aur-diff-sentinel baseline refresh
 The `updates` command asks `paru` or `yay` which AUR packages have updates,
 reviews cached AUR metadata against the latest AUR metadata, and reports
 findings. It does not install, build, or update packages; external helper, `pacman`, and `git` calls have a fixed 60-second timeout.
+If one package's candidate metadata cannot be fetched, the remaining updates
+are still reviewed and the command exits with an incomplete-analysis status.
 
 Use `baseline refresh` after you manually accept/update reviewed AUR metadata.
 If findings are present, refresh is blocked unless you use `--force`.
 If relevant metadata cannot be analyzed, refresh is always blocked, including with `--force`, and the command reports an incomplete analysis.
+If candidate metadata fetch fails for one package, that baseline stays unchanged
+while other eligible baselines may still be refreshed; the command exits with
+an incomplete-analysis status.
 After a successful manual update, `baseline refresh` can advance from the
 reviewed cached metadata even when no AUR updates are still pending.
 Baselines are only advanced when the installed package version matches the

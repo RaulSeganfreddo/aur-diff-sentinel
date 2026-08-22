@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from aur_diff_sentinel.cache import AurCache, read_metadata_text
+from aur_diff_sentinel.cache import AurCache, CacheMutationError, read_metadata_text
 from aur_diff_sentinel.metadata_diff import analyze_metadata_tree_changes
 from aur_diff_sentinel.models import Finding
 from aur_diff_sentinel.provider import AurUpdate, is_aur_package, installed_version
@@ -68,7 +68,11 @@ def review_updates(
     reviews: list[PackageReview] = []
 
     for update in updates:
-        latest_dir = cache.fetch_latest(update)
+        latest_dir, failed_review = _fetch_candidate_metadata(update, cache)
+        if failed_review is not None:
+            reviews.append(failed_review)
+            continue
+        assert latest_dir is not None
         review = PackageReview(update=update)
         baseline_available = cache.has_baseline(update.package)
 
@@ -108,17 +112,20 @@ def refresh_reviewed_baselines(
     """Refresh only complete reviewed metadata matching installed versions."""
     installed_version_getter = installed_version_getter or installed_version
     aur_package_checker = functools.lru_cache(maxsize=None)(aur_package_checker)
-    candidates = _refresh_candidates(updates, cache)
-    reviews = [
-        _refresh_candidate(
-            candidate,
-            cache,
-            force=force,
-            installed_version_getter=installed_version_getter,
-            aur_package_checker=aur_package_checker,
+    reviews: list[PackageReview] = []
+    for candidate in _refresh_candidates(updates, cache):
+        if isinstance(candidate, PackageReview):
+            reviews.append(candidate)
+            continue
+        reviews.append(
+            _refresh_candidate(
+                candidate,
+                cache,
+                force=force,
+                installed_version_getter=installed_version_getter,
+                aur_package_checker=aur_package_checker,
+            )
         )
-        for candidate in candidates
-    ]
 
     return UpdateReviewResult(
         reviews=reviews,
@@ -130,30 +137,58 @@ def refresh_reviewed_baselines(
 def _refresh_candidates(
     updates: list[AurUpdate],
     cache: AurCache,
-) -> list[RefreshCandidate]:
-    candidates: dict[str, RefreshCandidate] = {}
+) -> list[RefreshCandidate | PackageReview]:
+    candidates: list[RefreshCandidate | PackageReview] = []
+    pending_packages: set[str] = set()
 
     for update in updates:
-        latest_dir = cache.fetch_latest(update)
+        pending_packages.add(update.package)
+        latest_dir, failed_review = _fetch_candidate_metadata(update, cache)
+        if failed_review is not None:
+            failed_review.refresh_blocked = True
+            failed_review.notes.append("Review baseline was not refreshed.")
+            candidates.append(failed_review)
+            continue
+        assert latest_dir is not None
         latest_version = cache.latest_version(update.package) or update.new_version
-        candidates[update.package] = RefreshCandidate(
-            update=AurUpdate(update.package, update.old_version, latest_version),
-            latest_dir=latest_dir,
+        candidates.append(
+            RefreshCandidate(
+                update=AurUpdate(update.package, update.old_version, latest_version),
+                latest_dir=latest_dir,
+            )
         )
 
     for package in cache.reviewed_cached_packages():
-        if package in candidates:
+        if package in pending_packages:
             continue
         baseline_version = cache.baseline_version(package)
         latest_version = cache.latest_version(package)
         if baseline_version is None or latest_version is None:
             continue
-        candidates[package] = RefreshCandidate(
-            update=AurUpdate(package, baseline_version, latest_version),
-            latest_dir=cache.latest_dir(package),
+        candidates.append(
+            RefreshCandidate(
+                update=AurUpdate(package, baseline_version, latest_version),
+                latest_dir=cache.latest_dir(package),
+            )
         )
 
-    return list(candidates.values())
+    return candidates
+
+
+def _fetch_candidate_metadata(
+    update: AurUpdate,
+    cache: AurCache,
+) -> tuple[Path | None, PackageReview | None]:
+    try:
+        return cache.fetch_latest(update), None
+    except CacheMutationError:
+        raise
+    except RuntimeError as exc:
+        return None, PackageReview(
+            update=update,
+            notes=["Candidate metadata was not analyzed."],
+            analysis_errors=[f"candidate metadata fetch failed: {exc}"],
+        )
 
 
 def _refresh_candidate(

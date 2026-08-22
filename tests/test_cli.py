@@ -6,7 +6,9 @@ import subprocess
 import sys
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
+from importlib.metadata import PackageNotFoundError
 from pathlib import Path
+from unittest.mock import patch
 
 from aur_diff_sentinel.cli import run
 from tests.helpers import SAMPLES
@@ -61,6 +63,35 @@ class CliTests(unittest.TestCase):
         self.assertIn("source-url-added", stdout)
         self.assertIn("checksum-skip-added", stdout)
 
+    def test_top_level_version_uses_installed_distribution_metadata(self) -> None:
+        with patch("aur_diff_sentinel.cli.distribution_version", return_value="0.13.2") as metadata_version:
+            exit_code, stdout, stderr = self.run_cli(["--version"])
+
+        self.assertEqual((exit_code, stdout, stderr), (0, "aur-diff-sentinel 0.13.2\n", ""))
+        metadata_version.assert_called_once_with("aur-diff-sentinel")
+
+    def test_top_level_version_falls_back_to_unknown_without_distribution(self) -> None:
+        with patch(
+            "aur_diff_sentinel.cli.distribution_version",
+            side_effect=PackageNotFoundError("aur-diff-sentinel"),
+        ):
+            exit_code, stdout, stderr = self.run_cli(["--version"])
+
+        self.assertEqual((exit_code, stdout, stderr), (0, "aur-diff-sentinel unknown\n", ""))
+
+    def test_version_is_rejected_after_commands(self) -> None:
+        for argv in (["updates", "--version"], ["baseline", "--version"]):
+            with self.subTest(argv=argv):
+                exit_code, _stdout, stderr = self.run_cli(argv)
+                self.assertEqual(exit_code, 2)
+                self.assertIn("--version", stderr)
+
+    def test_top_level_help_mentions_version(self) -> None:
+        exit_code, stdout, stderr = self.run_cli(["--help"])
+
+        self.assertEqual((exit_code, stderr), (0, ""))
+        self.assertIn("--version", stdout)
+
     def test_cli_verbose_shows_lines_and_hints(self) -> None:
         exit_code, stdout, _stderr = self.run_cli(["--verbose", str(SAMPLES / "suspicious.PKGBUILD")])
 
@@ -90,4 +121,3 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0)
         self.assertIn("no obvious high-risk patterns", result.stdout.lower())
-

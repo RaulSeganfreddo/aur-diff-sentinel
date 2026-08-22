@@ -4,7 +4,13 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from aur_diff_sentinel.cache import MAX_METADATA_SCAN_BYTES, AurCache, metadata_version, unified_diff_dirs
+from aur_diff_sentinel.cache import (
+    MAX_METADATA_SCAN_BYTES,
+    AurCache,
+    CacheMutationError,
+    metadata_version,
+    unified_diff_dirs,
+)
 from aur_diff_sentinel.provider import AurUpdate
 from aur_diff_sentinel.report import format_update_review
 from aur_diff_sentinel.scanner import scan_diff_text
@@ -199,6 +205,62 @@ class UpdateWorkflowTests(TempRootTestCase):
         self.assertEqual(len(result.reviews), 2)
         self.assertTrue(result.reviews[0].analysis_errors)
         self.assertEqual(result.reviews[1].analysis_errors, [])
+
+    def test_update_batch_isolates_fetch_failure_without_using_stale_latest(self) -> None:
+        updates = [
+            AurUpdate("broken-pkg", "1.0-1", "1.1-1"),
+            AurUpdate("reviewed-pkg", "2.0-1", "2.1-1"),
+        ]
+        cache = AurCache(self.root)
+        for update, version in zip(updates, ("1.0", "2.0"), strict=True):
+            write_metadata(cache.baseline_dir(update.package), update.package, version, "1")
+        write_metadata(cache.latest_dir("broken-pkg"), "broken-pkg", "9.9", "1", checksum="SKIP")
+
+        def fetcher(update: AurUpdate, target: Path) -> None:
+            if update.package == "broken-pkg":
+                raise RuntimeError("network unavailable")
+            write_metadata(target, update.package, "2.1", "1", checksum="SKIP")
+
+        cache.fetcher = fetcher
+        result = review_updates(updates, cache, aur_package_checker=lambda package: False)
+
+        self.assertEqual([review.update.package for review in result.reviews], ["broken-pkg", "reviewed-pkg"])
+        self.assertEqual(
+            result.reviews[0].analysis_errors,
+            ["candidate metadata fetch failed: network unavailable"],
+        )
+        self.assertEqual(result.reviews[0].notes, ["Candidate metadata was not analyzed."])
+        self.assertEqual(result.reviews[0].findings, [])
+        self.assertIn("checksum-skip-added", {finding.rule_id for finding in result.reviews[1].findings})
+        self.assertTrue(result.analysis_incomplete)
+        self.assertIn("pkgver=9.9", (cache.latest_dir("broken-pkg") / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_update_batch_continues_after_multiple_fetch_failures(self) -> None:
+        updates = [
+            AurUpdate("broken-a", "1.0-1", "1.1-1"),
+            AurUpdate("broken-b", "2.0-1", "2.1-1"),
+            AurUpdate("complete-pkg", "3.0-1", "3.1-1"),
+        ]
+        fetched: list[str] = []
+
+        def fetcher(update: AurUpdate, target: Path) -> None:
+            fetched.append(update.package)
+            if update.package.startswith("broken-"):
+                raise RuntimeError(f"failed {update.package}")
+            write_metadata(target, update.package, "3.1", "1")
+
+        result = review_updates(updates, AurCache(self.root, fetcher=fetcher))
+
+        self.assertEqual(fetched, [update.package for update in updates])
+        self.assertEqual([bool(review.analysis_errors) for review in result.reviews], [True, True, False])
+
+    def test_cache_mutation_failure_still_aborts_update_batch(self) -> None:
+        update = AurUpdate("example-bin", "1.0-1", "1.1-1")
+        cache = AurCache(self.root, fetcher=fixture_fetcher("1.1", "1", "sha256sums=('abc')"))
+
+        with patch.object(Path, "rename", side_effect=OSError("write denied")):
+            with self.assertRaisesRegex(CacheMutationError, "write denied"):
+                review_updates([update], cache)
 
     def test_updates_review_path_reports_bun_install_sequence_and_keeps_baseline(self) -> None:
         update = AurUpdate("example-bin", "1.0-1", "1.1-1")
@@ -420,6 +482,7 @@ class UpdateWorkflowTests(TempRootTestCase):
             installed_version_getter=lambda package: {"pkg-a": "1.0-1", "pkg-b": "2.1-1"}[package],
         )
         refreshed = {review.update.package for review in result.reviews if review.baseline_refreshed}
+        self.assertEqual([review.update.package for review in result.reviews], ["pkg-a", "pkg-b"])
         self.assertEqual(refreshed, {"pkg-b"})
         self.assertEqual(cache.baseline_version("pkg-a"), "1.0-1")
         self.assertEqual(cache.baseline_version("pkg-b"), "2.1-1")
@@ -436,6 +499,42 @@ class UpdateWorkflowTests(TempRootTestCase):
         self.assertEqual(result.reviews[0].update.new_version, "1.2-1")
         self.assertEqual(cache.baseline_version(update.package), "1.2-1")
         self.assertIn("pkgver=1.2", (cache.baseline_dir(update.package) / "PKGBUILD").read_text(encoding="utf-8"))
+
+    def test_refresh_isolates_failed_fetch_and_refreshes_later_package(self) -> None:
+        updates = [
+            AurUpdate("broken-pkg", "1.0-1", "1.1-1"),
+            AurUpdate("complete-pkg", "2.0-1", "2.1-1"),
+        ]
+        cache = AurCache(self.root)
+        write_cached_pair(cache, "broken-pkg", ("1.0", "1"), ("1.1", "1"))
+        write_cached_pair(cache, "complete-pkg", ("2.0", "1"), ("2.0", "1"))
+
+        def fetcher(update: AurUpdate, target: Path) -> None:
+            if update.package == "broken-pkg":
+                raise RuntimeError("AUR unavailable")
+            write_metadata(target, update.package, "2.1", "1")
+
+        cache.fetcher = fetcher
+        result = refresh_reviewed_baselines(
+            updates,
+            cache,
+            force=True,
+            installed_version_getter=lambda package: {
+                "broken-pkg": "1.1-1",
+                "complete-pkg": "2.1-1",
+            }[package],
+        )
+
+        self.assertEqual([review.update.package for review in result.reviews], ["broken-pkg", "complete-pkg"])
+        self.assertTrue(result.reviews[0].refresh_blocked)
+        self.assertEqual(
+            result.reviews[0].analysis_errors,
+            ["candidate metadata fetch failed: AUR unavailable"],
+        )
+        self.assertTrue(result.reviews[1].baseline_refreshed)
+        self.assertTrue(result.analysis_incomplete)
+        self.assertEqual(cache.baseline_version("broken-pkg"), "1.0-1")
+        self.assertEqual(cache.baseline_version("complete-pkg"), "2.1-1")
 
     def test_cached_refresh_states(self) -> None:
         cases = (
