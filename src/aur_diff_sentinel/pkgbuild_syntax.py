@@ -97,7 +97,7 @@ class ArrayCollector:
         if self.active is not None:
             self.active.lines.append((line_number, content))
             self.active.changed |= changed
-            if has_unquoted_closing_paren(content):
+            if unquoted_closing_paren_index(content) is not None:
                 return self._finish()
             return None
 
@@ -115,7 +115,7 @@ class ArrayCollector:
             changed=changed,
         )
         rest = match.group(3)
-        if "(" in rest and not has_unquoted_closing_paren(rest):
+        if "(" in rest and unquoted_closing_paren_index(rest) is None:
             self.active = block
             return None
         return _parsed_array(block)
@@ -192,16 +192,11 @@ def _parsed_array(block: _ArrayBlock) -> ParsedArray:
 
 
 def filename_from_diff_header(line: str) -> str | None:
-    parts = line.split(maxsplit=2)
-    if len(parts) < 2:
+    parts = line.split()
+    if len(parts) < 2 or parts[1] == "/dev/null":
         return None
-
     path = parts[1]
-    if path == "/dev/null":
-        return None
-    if path.startswith(("a/", "b/")):
-        return path[2:]
-    return path
+    return path[2:] if path.startswith(("a/", "b/")) else path
 
 
 def is_pkgbuild(filename: str | None) -> bool:
@@ -221,27 +216,20 @@ def is_dependency_name(name: str) -> bool:
 
 
 def array_suffix(name: str) -> str:
-    source_match = SOURCE_ARRAY_RE.match(name)
-    if source_match:
-        return source_match.group("suffix") or ""
-
-    checksum_match = CHECKSUM_ARRAY_RE.match(name)
-    if checksum_match:
-        return checksum_match.group("suffix") or ""
-
+    for pattern in (SOURCE_ARRAY_RE, CHECKSUM_ARRAY_RE):
+        if match := pattern.match(name):
+            return match.group("suffix") or ""
     return ""
 
 
 def checksum_algorithm(name: str) -> str | None:
-    checksum_match = CHECKSUM_ARRAY_RE.match(name)
-    if checksum_match:
-        return checksum_match.group("algorithm").lower()
+    if match := CHECKSUM_ARRAY_RE.match(name):
+        return match.group("algorithm").lower()
     return None
 
 
 def dependency_group(name: str) -> str:
-    match = DEPENDENCY_ARRAY_RE.match(name)
-    if match:
+    if match := DEPENDENCY_ARRAY_RE.match(name):
         return match.group("group").lower()
     return name.lower()
 
@@ -258,9 +246,8 @@ def is_vcs_source(source: str | None) -> bool:
 
 
 def source_without_alias(source: str) -> str:
-    if "::" not in source:
-        return source
-    return source.split("::", 1)[1]
+    alias, separator, value = source.partition("::")
+    return value if separator else alias
 
 
 def split_array_values(segment: str, *, quoted_fallback: bool = False) -> list[str]:
@@ -280,10 +267,6 @@ def array_value_text(content: str) -> str:
     if closing_paren_index is not None:
         content = content[:closing_paren_index]
     return content.strip()
-
-
-def has_unquoted_closing_paren(content: str) -> bool:
-    return unquoted_closing_paren_index(content) is not None
 
 
 def unquoted_closing_paren_index(content: str) -> int | None:

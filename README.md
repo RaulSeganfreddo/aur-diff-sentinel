@@ -48,10 +48,11 @@ aur-diff-sentinel baseline refresh
 
 The `updates` command asks `paru` or `yay` which AUR packages have updates,
 reviews cached AUR metadata against the latest AUR metadata, and reports
-findings. It does not install, build, or update packages.
+findings. It does not install, build, or update packages; external helper, `pacman`, and `git` calls have a fixed 60-second timeout.
 
 Use `baseline refresh` after you manually accept/update reviewed AUR metadata.
 If findings are present, refresh is blocked unless you use `--force`.
+If relevant metadata cannot be analyzed, refresh is always blocked, including with `--force`, and the command reports an incomplete analysis.
 After a successful manual update, `baseline refresh` can advance from the
 reviewed cached metadata even when no AUR updates are still pending.
 Baselines are only advanced when the installed package version matches the
@@ -139,7 +140,7 @@ finding without changing the default compact output.
 
 When using `updates`, the output starts with an attention summary so packages
 with high- or medium-severity findings are easy to inspect first. Packages with
-no findings are still listed.
+no findings are still listed; skipped metadata is shown as an explicit warning.
 
 ## Development
 
@@ -152,7 +153,7 @@ pip install -e ".[dev]"
 
 ## Exit codes
 
-`0` no findings, `1` findings found, `2` error.
+`0` no findings, `1` findings found, `2` operational error or incomplete analysis.
 
 ## Limits
 

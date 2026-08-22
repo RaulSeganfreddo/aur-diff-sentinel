@@ -33,13 +33,7 @@ class Rule:
         hint: str,
         flags: int = re.IGNORECASE,
     ) -> "Rule":
-        return cls(
-            id=id,
-            severity=severity,
-            pattern=re.compile(pattern, flags),
-            message=message,
-            hint=hint,
-        )
+        return cls(id, severity, re.compile(pattern, flags), message, hint)
 
     @classmethod
     def contextual(
@@ -51,21 +45,12 @@ class Rule:
         message: str,
         hint: str,
     ) -> "Rule":
-        return cls(
-            id=id,
-            severity=severity,
-            pattern=None,
-            message=message,
-            hint=hint,
-            matcher=matcher,
-        )
+        return cls(id, severity, None, message, hint, matcher)
 
     def matches(self, line: "SourceLine") -> bool:
         if self.matcher is not None:
             return self.matcher(line)
-        if self.pattern is None:
-            return False
-        return self.pattern.search(line.content) is not None
+        return bool(self.pattern and self.pattern.search(line.content))
 
 
 @dataclass(frozen=True)
@@ -98,3 +83,29 @@ class Finding:
     execution_context: str | None = None
     old_value: str | None = None
     new_value: str | None = None
+
+    @classmethod
+    def from_source(
+        cls,
+        source: SourceLine,
+        *,
+        rule_id: str,
+        severity: Severity,
+        message: str,
+        hint: str,
+    ) -> Finding:
+        return cls(
+            rule_id,
+            severity,
+            message,
+            source.line_number,
+            source.content,
+            hint,
+            source.filename,
+            source.source_type,
+            source.diff_line_number,
+            source.target_line_number,
+            source.change_type,
+            source.function_name,
+            source.execution_context,
+        )

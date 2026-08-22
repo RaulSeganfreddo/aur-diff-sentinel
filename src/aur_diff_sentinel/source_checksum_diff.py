@@ -7,16 +7,18 @@ from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.pkgbuild_analysis import checksum_skip_hint
 from aur_diff_sentinel.pkgbuild_diff_parser import (
     DiffArrays,
-    DiffValue,
     checksum_arrays_by_suffix,
-    is_checksum,
-    is_checksum_array,
-    is_source_url,
-    old_checksum_value,
+    paired_array_value,
     source_arrays_by_suffix,
-    source_for_checksum_value,
 )
-from aur_diff_sentinel.pkgbuild_syntax import array_suffix, is_vcs_source, source_without_alias
+from aur_diff_sentinel.pkgbuild_syntax import (
+    ArrayValue,
+    array_suffix,
+    is_checksum_name,
+    is_source_name,
+    is_vcs_source,
+    source_without_alias,
+)
 
 
 CHECKSUM_STRENGTH = {
@@ -31,8 +33,8 @@ CHECKSUM_STRENGTH = {
 
 
 def compare_source_urls(
-    removed: list[DiffValue],
-    added: list[DiffValue],
+    removed: list[ArrayValue],
+    added: list[ArrayValue],
 ) -> list[Finding]:
     findings: list[Finding] = []
     old_groups = _source_url_groups(removed)
@@ -40,7 +42,7 @@ def compare_source_urls(
 
     for key, new_urls in new_groups.items():
         old_urls = list(old_groups.get(key, ()))
-        unmatched_new: list[DiffValue] = []
+        unmatched_new: list[ArrayValue] = []
         for new_url in new_urls:
             canonical = source_without_alias(new_url.value)
             match = next(
@@ -75,18 +77,18 @@ def compare_source_urls(
     return findings
 
 
-def _source_url_groups(values: list[DiffValue]) -> dict[tuple[str | None, str], list[DiffValue]]:
-    groups: dict[tuple[str | None, str], list[DiffValue]] = {}
+def _source_url_groups(values: list[ArrayValue]) -> dict[tuple[str | None, str], list[ArrayValue]]:
+    groups: dict[tuple[str | None, str], list[ArrayValue]] = {}
     for value in values:
-        if is_source_url(value):
+        if is_source_name(value.name) and urlparse(source_without_alias(value.value)).scheme in {"http", "https"}:
             groups.setdefault((value.filename, array_suffix(value.name)), []).append(value)
     return groups
 
 
 def _append_url_change_findings(
     findings: list[Finding],
-    old_url: DiffValue,
-    new_url: DiffValue,
+    old_url: ArrayValue,
+    new_url: ArrayValue,
 ) -> None:
     old_parsed = urlparse(source_without_alias(old_url.value))
     new_parsed = urlparse(source_without_alias(new_url.value))
@@ -123,21 +125,18 @@ def find_removed_checksum_arrays(arrays: DiffArrays) -> list[Finding]:
     new_checksums_by_suffix = checksum_arrays_by_suffix(arrays.new_state)
 
     for old_array in arrays.removed:
-        if not is_checksum_array(old_array):
-            continue
-        if old_array.suffix.lower() in new_checksums_by_suffix:
-            continue
-        findings.append(
-            diff_finding(
-                rule_id="checksum-array-removed",
-                severity=Severity.HIGH,
-                message="Checksum array was removed",
-                hint="Removing checksums weakens source verification and should be reviewed.",
-                location=old_array,
-                old_value=old_array.name,
-                new_value=None,
+        if is_checksum_name(old_array.name) and old_array.suffix.lower() not in new_checksums_by_suffix:
+            findings.append(
+                diff_finding(
+                    rule_id="checksum-array-removed",
+                    severity=Severity.HIGH,
+                    message="Checksum array was removed",
+                    hint="Removing checksums weakens source verification and should be reviewed.",
+                    location=old_array,
+                    old_value=old_array.name,
+                    new_value=None,
+                )
             )
-        )
 
     return findings
 
@@ -181,11 +180,12 @@ def find_checksum_count_mismatches(arrays: DiffArrays) -> list[Finding]:
 
     for suffix, source_array in source_arrays.items():
         checksum_array = checksum_arrays.get(suffix)
-        if checksum_array is None:
-            continue
-        if not source_array.values or not checksum_array.values:
-            continue
-        if len(source_array.values) == len(checksum_array.values):
+        if (
+            checksum_array is None
+            or not source_array.values
+            or not checksum_array.values
+            or len(source_array.values) == len(checksum_array.values)
+        ):
             continue
 
         findings.append(
@@ -208,10 +208,10 @@ def find_added_checksum_skips(arrays: DiffArrays) -> list[Finding]:
     new_sources_by_suffix = source_arrays_by_suffix(arrays.new_state)
     findings: list[Finding] = []
 
-    for new_value in (value for value in arrays.added_values if is_checksum(value)):
-        old_value = old_checksum_value(new_value, old_checksums_by_suffix)
+    for new_value in (value for value in arrays.added_values if is_checksum_name(value.name) and value.value):
+        old_value = paired_array_value(new_value, old_checksums_by_suffix)
         if new_value.value == "SKIP" and old_value != "SKIP":
-            source_value = source_for_checksum_value(new_value, new_sources_by_suffix)
+            source_value = paired_array_value(new_value, new_sources_by_suffix)
             severity = Severity.MEDIUM if is_vcs_source(source_value) else Severity.HIGH
             findings.append(
                 diff_finding(

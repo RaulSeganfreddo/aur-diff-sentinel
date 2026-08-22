@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from aur_diff_sentinel.models import Finding, Severity
-from aur_diff_sentinel.pkgbuild_diff_parser import DiffArray, DiffValue
+from aur_diff_sentinel.pkgbuild_syntax import ArrayValue, ParsedArray
 
 
 def diff_finding(
@@ -10,7 +10,7 @@ def diff_finding(
     severity: Severity,
     message: str,
     hint: str,
-    location: DiffArray | DiffValue,
+    location: ParsedArray | ArrayValue,
     old_value: str | None,
     new_value: str | None,
 ) -> Finding:

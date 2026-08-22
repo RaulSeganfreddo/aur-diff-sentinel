@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable
+from dataclasses import replace
 from pathlib import PurePosixPath
 
 from aur_diff_sentinel.command_analysis import (
@@ -38,23 +39,15 @@ def sequence_findings(lines: list[SourceLine]) -> list[Finding]:
                 and block_key not in seen_temp_package_install
             ):
                 findings.append(
-                    Finding(
+                    Finding.from_source(
+                        line,
                         rule_id="temporary-directory-package-install",
                         severity=Severity.HIGH,
                         message="Package manager runs from a temporary directory",
-                        line_number=line.line_number,
-                        line_content=line.content,
                         hint=(
                             "Installing packages from /tmp or /var/tmp in an install script "
                             "or pacman hook runs on the live system and needs review."
                         ),
-                        filename=line.filename,
-                        source_type=line.source_type,
-                        diff_line_number=line.diff_line_number,
-                        target_line_number=line.target_line_number,
-                        change_type=line.change_type,
-                        function_name=line.function_name,
-                        execution_context=line.execution_context,
                     )
                 )
                 seen_temp_package_install.add(block_key)
@@ -132,23 +125,17 @@ def _add_suspicious_live_install_sequence(findings: list[Finding]) -> list[Findi
     )
     return [
         *findings,
-        Finding(
+        replace(
+            anchor,
             rule_id="suspicious-live-install-sequence",
             severity=Severity.HIGH,
             message="Combined live-system package install sequence",
-            line_number=anchor.line_number,
-            line_content=anchor.line_content,
             hint=(
                 "A new JavaScript tooling dependency, install script or hook, "
                 "temporary directory, and package-manager command appeared together."
             ),
-            filename=anchor.filename,
-            source_type=anchor.source_type,
-            diff_line_number=anchor.diff_line_number,
-            target_line_number=anchor.target_line_number,
-            change_type=anchor.change_type,
-            function_name=anchor.function_name,
-            execution_context=anchor.execution_context,
+            old_value=None,
+            new_value=None,
         ),
     ]
 
@@ -195,23 +182,17 @@ def _add_dependency_risk_composite(findings: list[Finding]) -> list[Finding]:
     )
     return [
         *findings,
-        Finding(
+        replace(
+            anchor,
             rule_id="dependency-with-risk-signals",
             severity=Severity.HIGH,
             message="New dependency combined with high-risk signals",
-            line_number=anchor.line_number,
-            line_content=anchor.line_content,
             hint=(
                 "New dependencies appeared together with other high-risk signals. "
                 "Combined review is strongly recommended."
             ),
-            filename=anchor.filename,
-            source_type=anchor.source_type,
-            diff_line_number=anchor.diff_line_number,
-            target_line_number=anchor.target_line_number,
-            change_type=anchor.change_type,
-            function_name=anchor.function_name,
-            execution_context=anchor.execution_context,
+            old_value=None,
+            new_value=None,
         ),
     ]
 

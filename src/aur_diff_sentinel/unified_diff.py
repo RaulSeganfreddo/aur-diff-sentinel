@@ -43,13 +43,9 @@ class DiffLine:
 
     @property
     def line_number(self) -> int:
-        if self.change_type == "removed" and self.old_line_number is not None:
-            return self.old_line_number
-        if self.new_line_number is not None:
-            return self.new_line_number
-        if self.old_line_number is not None:
-            return self.old_line_number
-        return 0
+        preferred = self.old_line_number if self.change_type == "removed" else self.new_line_number
+        fallback = self.new_line_number if self.new_line_number is not None else self.old_line_number
+        return preferred if preferred is not None else fallback or 0
 
 
 def iter_diff_lines(text: str, *, fallback_filename: str | None = None) -> Iterator[DiffLine]:
@@ -62,11 +58,9 @@ def iter_diff_lines(text: str, *, fallback_filename: str | None = None) -> Itera
 
     for diff_line_number, raw_line in enumerate(text.splitlines(), start=1):
         if raw_line.startswith("diff --git "):
-            old_filename = None
-            new_filename = None
+            old_filename = new_filename = None
             has_new_header = False
-            old_line_number = None
-            new_line_number = None
+            old_line_number = new_line_number = None
             continue
 
         if raw_line.startswith("---"):
@@ -96,28 +90,21 @@ def iter_diff_lines(text: str, *, fallback_filename: str | None = None) -> Itera
             new_filename=new_filename if has_new_header else fallback_filename,
         )
 
-        if raw_line.startswith("-"):
+        if raw_line.startswith(("-", "+")):
+            added = raw_line.startswith("+")
             yield DiffLine(
                 diff_line_number=diff_line_number,
                 hunk_index=hunk_index,
-                change_type="removed",
+                change_type="added" if added else "removed",
                 content=raw_line[1:],
                 file=diff_file,
-                old_line_number=old_line_number,
+                old_line_number=None if added else old_line_number,
+                new_line_number=new_line_number if added else None,
             )
-            old_line_number += 1
-            continue
-
-        if raw_line.startswith("+"):
-            yield DiffLine(
-                diff_line_number=diff_line_number,
-                hunk_index=hunk_index,
-                change_type="added",
-                content=raw_line[1:],
-                file=diff_file,
-                new_line_number=new_line_number,
-            )
-            new_line_number += 1
+            if added:
+                new_line_number += 1
+            else:
+                old_line_number += 1
             continue
 
         content = raw_line[1:] if raw_line.startswith(" ") else raw_line

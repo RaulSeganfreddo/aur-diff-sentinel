@@ -32,20 +32,12 @@ def scan_lines(
             candidate = line if rule.matcher is not None else regex_line
             if rule.matches(candidate):
                 findings.append(
-                    Finding(
+                    Finding.from_source(
+                        line,
                         rule_id=rule.id,
                         severity=rule.severity,
                         message=rule.message,
-                        line_number=line.line_number,
-                        line_content=line.content,
                         hint=rule.hint,
-                        filename=line.filename,
-                        source_type=line.source_type,
-                        diff_line_number=line.diff_line_number,
-                        target_line_number=line.target_line_number,
-                        change_type=line.change_type,
-                        function_name=line.function_name,
-                        execution_context=line.execution_context,
                     )
                 )
 

@@ -19,6 +19,7 @@ from aur_diff_sentinel.provider import (
 Fetcher = Callable[[AurUpdate, Path], None]
 
 BASELINE_VERSION_FILE = ".aur-sentinel-baseline-version"
+MAX_METADATA_SCAN_BYTES = 512 * 1024
 VERSION_FIELD_RE = re.compile(r"^(epoch|pkgver|pkgrel)\s*=\s*(.*?)\s*$")
 
 
@@ -90,7 +91,7 @@ class AurCache:
                 continue
             try:
                 version = metadata_version(path.read_text(encoding="utf-8"))
-            except UnicodeDecodeError:
+            except (OSError, UnicodeDecodeError):
                 continue
             if version:
                 return version
@@ -126,7 +127,9 @@ class AurCache:
             if path.exists():
                 shutil.rmtree(path)
 
-    def diff_baseline_to_latest(self, package: str, latest_dir: Path) -> str:
+    def diff_baseline_to_latest(
+        self, package: str, latest_dir: Path
+    ) -> tuple[str, list[str]]:
         return unified_diff_dirs(self.baseline_dir(package), latest_dir)
 
     def _default_fetcher(self, update: AurUpdate, target: Path) -> None:
@@ -245,15 +248,20 @@ def copy_metadata_tree(source: Path, target: Path) -> None:
         shutil.copy2(path, destination)
 
 
-def unified_diff_dirs(old_dir: Path, new_dir: Path) -> str:
+def unified_diff_dirs(old_dir: Path, new_dir: Path) -> tuple[str, list[str]]:
+    """Return a bounded text diff and any files that could not be analyzed."""
     lines: list[str] = []
+    errors: list[str] = []
     for relative_path in sorted(_relative_metadata_paths(old_dir) | _relative_metadata_paths(new_dir)):
         old_path = old_dir / relative_path
         new_path = new_dir / relative_path
-        old_exists = old_path.exists()
-        new_exists = new_path.exists()
-        old_text = _read_text_or_empty(old_path)
-        new_text = _read_text_or_empty(new_path)
+        old_exists = old_path.exists() or old_path.is_symlink()
+        new_exists = new_path.exists() or new_path.is_symlink()
+        old_text, old_error = read_metadata_text(old_path, relative_path, "baseline")
+        new_text, new_error = read_metadata_text(new_path, relative_path, "candidate")
+        errors.extend(error for error in (old_error, new_error) if error)
+        if old_error or new_error:
+            continue
         if old_exists == new_exists and old_text == new_text:
             continue
 
@@ -269,37 +277,48 @@ def unified_diff_dirs(old_dir: Path, new_dir: Path) -> str:
             )
         )
 
-    return "\n".join(line.rstrip("\n") for line in lines)
+    return "\n".join(line.rstrip("\n") for line in lines), errors
 
 
-def _metadata_paths(root: Path) -> list[Path]:
+def _metadata_paths(root: Path, *, include_symlinks: bool = False) -> list[Path]:
     if not root.exists():
         return []
     return [
         path
         for path in root.rglob("*")
-        if path.is_file()
-        and not path.is_symlink()
+        if (path.is_file() or include_symlinks and path.is_symlink())
+        and (include_symlinks or not path.is_symlink())
         and _is_metadata_path_allowed(path.relative_to(root))
     ]
 
 
 def _relative_metadata_paths(root: Path) -> set[Path]:
-    return {path.relative_to(root) for path in _metadata_paths(root)}
+    return {path.relative_to(root) for path in _metadata_paths(root, include_symlinks=True)}
 
 
-def _read_text_or_empty(path: Path) -> str:
-    if not path.exists():
-        return ""
+def read_metadata_text(
+    path: Path,
+    relative_path: Path,
+    source: str,
+) -> tuple[str, str | None]:
+    """Read bounded UTF-8 metadata, returning a user-facing error instead of hiding it."""
+    label = f"{source} metadata {relative_path}"
+    if path.is_symlink():
+        return "", f"{label}: symbolic links are not analyzed"
     try:
-        return path.read_text(encoding="utf-8")
+        size = path.stat().st_size
+    except FileNotFoundError:
+        return "", None
+    except OSError as exc:
+        return "", f"{label}: cannot be read: {exc}"
+    if size > MAX_METADATA_SCAN_BYTES:
+        return "", f"{label}: exceeds the {MAX_METADATA_SCAN_BYTES}-byte scan limit"
+    try:
+        return path.read_text(encoding="utf-8"), None
+    except OSError as exc:
+        return "", f"{label}: cannot be read: {exc}"
     except UnicodeDecodeError:
-        return ""
-
-
-def _is_ignored_path(path: Path) -> bool:
-    parts = path.parts
-    return ".git" in parts or path.name == BASELINE_VERSION_FILE
+        return "", f"{label}: is not valid UTF-8"
 
 
 def is_valid_package_name(package: str) -> bool:
@@ -316,7 +335,8 @@ def _is_metadata_path_allowed(path: Path) -> bool:
         and not path.is_absolute()
         and ".." not in path.parts
         and "\\" not in path.as_posix()
-        and not _is_ignored_path(path)
+        and ".git" not in path.parts
+        and path.name != BASELINE_VERSION_FILE
     )
 
 
@@ -332,6 +352,7 @@ def _replace_tree(
     root: Path,
     populate: Callable[[Path], None],
 ) -> None:
+    """Roll back handled replacement failures; this is not crash- or concurrency-atomic."""
     _ensure_path_within(target, root)
     target.parent.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix=f".{target.name}-", dir=target.parent))

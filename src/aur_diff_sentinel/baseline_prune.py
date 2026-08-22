@@ -16,14 +16,12 @@ class BaselinePruneScan:
     unknown: list[InstalledPackageStatus] = field(default_factory=list)
 
 
-@dataclass
-class BaselinePruneResult:
-    pruned: list[str] = field(default_factory=list)
-    unknown: list[InstalledPackageStatus] = field(default_factory=list)
-
-
 class SelectionError(ValueError):
     pass
+
+
+NO_PRUNE_CANDIDATES = "No cached reviewed packages are missing from the system.\nNo packages were updated."
+NO_PRUNE_SELECTION = "No sentinel cache entries were pruned.\nNo packages were updated."
 
 
 def scan_prune_candidates(
@@ -46,38 +44,20 @@ def scan_prune_candidates(
     return scan
 
 
-def prune_cached_packages(cache: AurCache, packages: Sequence[str]) -> BaselinePruneResult:
-    result = BaselinePruneResult()
+def prune_cached_packages(cache: AurCache, packages: Sequence[str]) -> list[str]:
+    pruned: list[str] = []
     for package in packages:
         cache.prune_package(package)
-        result.pruned.append(package)
-    return result
+        pruned.append(package)
+    return pruned
 
 
-def format_no_prune_candidates() -> str:
-    return "\n".join(
-        [
-            "No cached reviewed packages are missing from the system.",
-            "No packages were updated.",
-        ]
-    )
-
-
-def format_no_prune_selection() -> str:
-    return "\n".join(
-        [
-            "No sentinel cache entries were pruned.",
-            "No packages were updated.",
-        ]
-    )
-
-
-def format_prune_result(result: BaselinePruneResult) -> str:
+def format_prune_result(pruned: Sequence[str]) -> str:
     lines = [
-        f"Pruned sentinel cache for packages no longer installed: {len(result.pruned)}",
+        f"Pruned sentinel cache for packages no longer installed: {len(pruned)}",
         "",
     ]
-    lines.extend(f"- {package}" for package in result.pruned)
+    lines.extend(f"- {package}" for package in pruned)
     lines.extend(["", "No packages were updated."])
     return "\n".join(lines)
 

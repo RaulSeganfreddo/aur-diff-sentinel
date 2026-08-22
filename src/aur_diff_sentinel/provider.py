@@ -8,6 +8,7 @@ from dataclasses import dataclass
 
 
 CommandRunner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
+COMMAND_TIMEOUT_SECONDS = 60
 PACKAGE_NAME_RE = re.compile(r"^[A-Za-z0-9@._+-]+$")
 
 
@@ -27,12 +28,19 @@ class InstalledPackageStatus:
 
 
 def default_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        check=False,
-        capture_output=True,
-        text=True,
-    )
+    """Run an argument vector without a shell and with a fixed timeout."""
+    try:
+        return subprocess.run(
+            list(command),
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"{command[0]} timed out after {COMMAND_TIMEOUT_SECONDS} seconds") from exc
+    except OSError as exc:
+        raise RuntimeError(f"cannot run {command[0]}: {exc}") from exc
 
 
 def detect_helper() -> str | None:
@@ -80,7 +88,7 @@ def query_installed_package(
     validate_package_name(package)
     try:
         result = runner(["pacman", "-Q", package])
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return InstalledPackageStatus(package=package, error=str(exc))
     if result.returncode != 0:
         error = result.stderr.strip() or result.stdout.strip() or "unknown pacman error"
@@ -101,7 +109,7 @@ def query_installed_package(
 
 def _is_not_installed_error(error: str) -> bool:
     lowered = error.lower()
-    return "was not found" in lowered or "not found" in lowered
+    return "package '" in lowered and "was not found" in lowered
 
 
 def validate_package_name(package: str) -> None:
@@ -134,7 +142,10 @@ def is_aur_package(
         result = runner(["pacman", "-Si", package])
     except (RuntimeError, OSError):
         return False
-    return result.returncode != 0
+    if result.returncode == 0:
+        return False
+    error = result.stderr.strip() or result.stdout.strip()
+    return _is_not_installed_error(error)
 
 
 def parse_update_output(output: str) -> list[AurUpdate]:
@@ -147,25 +158,14 @@ def parse_update_output(output: str) -> list[AurUpdate]:
 
         if "->" in parts:
             arrow_index = parts.index("->")
-            if arrow_index >= 2 and arrow_index + 1 < len(parts):
-                validate_package_name(parts[0])
-                updates.append(
-                    AurUpdate(
-                        package=parts[0],
-                        old_version=parts[arrow_index - 1],
-                        new_version=parts[arrow_index + 1],
-                    )
-                )
+            if arrow_index < 2 or arrow_index + 1 >= len(parts):
                 continue
-
-        if len(parts) >= 3:
-            validate_package_name(parts[0])
-            updates.append(
-                AurUpdate(
-                    package=parts[0],
-                    old_version=parts[1],
-                    new_version=parts[2],
-                )
-            )
+            old_version, new_version = parts[arrow_index - 1], parts[arrow_index + 1]
+        elif len(parts) >= 3:
+            old_version, new_version = parts[1:3]
+        else:
+            continue
+        validate_package_name(parts[0])
+        updates.append(AurUpdate(parts[0], old_version, new_version))
 
     return updates

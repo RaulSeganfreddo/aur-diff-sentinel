@@ -124,9 +124,17 @@ class FunctionContextTracker:
         return function_name, self._execution_context(function_name)
 
     def _execution_context(self, function_name: str | None) -> str | None:
-        if _is_hook_filename(self.filename):
+        if self.filename and self.filename.endswith(".hook"):
             return "hook"
-        if function_name in SCRIPTLET_FUNCTIONS or _is_scriptlet_filename(self.filename, self.scriptlet_files):
+        basename = self.filename.rsplit("/", maxsplit=1)[-1] if self.filename else None
+        if function_name in SCRIPTLET_FUNCTIONS or bool(
+            self.filename
+            and (
+                self.filename.endswith(".install")
+                or self.filename in self.scriptlet_files
+                or basename in self.scriptlet_files
+            )
+        ):
             return "scriptlet"
         if function_name in BUILD_FUNCTIONS:
             return "build"
@@ -135,13 +143,3 @@ class FunctionContextTracker:
 
 def _brace_delta(content: str) -> int:
     return content.count("{") - content.count("}")
-
-
-def _is_hook_filename(filename: str | None) -> bool:
-    return bool(filename and filename.endswith(".hook"))
-
-
-def _is_scriptlet_filename(filename: str | None, scriptlet_files: Collection[str]) -> bool:
-    if not filename:
-        return False
-    return filename.endswith(".install") or filename in scriptlet_files or filename.rsplit("/", maxsplit=1)[-1] in scriptlet_files

@@ -27,12 +27,8 @@ REDIRECT_TO_SENSITIVE_PATH_RE = re.compile(
 )
 
 
-def _is_build_function(line: SourceLine) -> bool:
-    return line.execution_context == "build"
-
-
 def _network_in_build(line: SourceLine) -> bool:
-    return _is_build_function(line) and any(
+    return line.execution_context == "build" and any(
         _is_network_command(tokens) for tokens in shell_commands(line.content)
     )
 
@@ -61,13 +57,12 @@ def _decoded_pipe_shell(line: SourceLine) -> bool:
 def _pipeline_match(line: SourceLine, producer) -> bool:
     for pipeline in shell_pipelines(line.content):
         for index, tokens in enumerate(pipeline[:-1]):
-            if producer(tokens) and any(_is_shell(command) for command in pipeline[index + 1 :]):
+            if producer(tokens) and any(
+                command_name(command[0]) in {"sh", "bash"}
+                for command in pipeline[index + 1 :]
+            ):
                 return True
     return False
-
-
-def _is_shell(tokens: list[str]) -> bool:
-    return command_name(tokens[0]) in {"sh", "bash"}
 
 
 def _is_decoder(tokens: list[str]) -> bool:
@@ -126,22 +121,14 @@ def _is_sensitive_path(token: str) -> bool:
     )
 
 
-def _tokens(line: str) -> list[str]:
-    return tokens_from_shell_segment(line)
-
-
-def _non_option_tokens(tokens: list[str]) -> list[str]:
-    return [token for token in tokens if not token.startswith("-")]
-
-
 def _writes_outside_pkgdir(line: SourceLine) -> bool:
-    if not _is_build_function(line):
+    if line.execution_context != "build":
         return False
 
     if REDIRECT_TO_SENSITIVE_PATH_RE.search(line.content):
         return True
 
-    tokens = _tokens(line.content)
+    tokens = tokens_from_shell_segment(line.content)
     if not tokens:
         return False
 
@@ -152,7 +139,7 @@ def _writes_outside_pkgdir(line: SourceLine) -> bool:
     if command in {"install", "cp", "mv"}:
         return len(tokens) > 1 and _is_sensitive_path(tokens[-1])
 
-    operands = _non_option_tokens(tokens[1:])
+    operands = [token for token in tokens[1:] if not token.startswith("-")]
     if command == "chmod" and len(operands) > 1:
         operands = operands[1:]
     if command == "chown" and len(operands) > 1:

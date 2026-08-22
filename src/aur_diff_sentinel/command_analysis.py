@@ -7,14 +7,6 @@ def uses_js_package_manager(content: str) -> bool:
     return any(is_js_package_manager_command(tokens) for tokens in shell_commands(content))
 
 
-def changes_to_temp_dir(content: str) -> bool:
-    return any(is_cd_to_temp_dir(tokens) for tokens in shell_commands(content))
-
-
-def changes_to_non_temp_dir(content: str) -> bool:
-    return any(is_cd_to_non_temp_dir(tokens) for tokens in shell_commands(content))
-
-
 def is_js_package_manager_command(tokens: list[str]) -> bool:
     command = command_name(tokens[0])
     args = [token.lower() for token in tokens[1:]]

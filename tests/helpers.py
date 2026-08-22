@@ -2,14 +2,25 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import tempfile
+import unittest
+from collections.abc import Iterable
 from pathlib import Path
 
+from aur_diff_sentinel.cache import AurCache
 from aur_diff_sentinel.models import Finding, Severity
 from aur_diff_sentinel.provider import AurUpdate
 from aur_diff_sentinel.scanner import scan_text
 
 
 SAMPLES = Path(__file__).parent / "samples"
+
+
+class TempRootTestCase(unittest.TestCase):
+    root: Path
+
+    def setUp(self) -> None:
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
 
 
 def rule_ids(text: str) -> set[str]:
@@ -55,18 +66,26 @@ def fixture_fetcher(pkgver: str, pkgrel: str, extra_line: str):
     return fetcher
 
 
-def write_metadata(root: Path, pkgname: str, pkgver: str, pkgrel: str) -> None:
+def write_metadata(
+    root: Path,
+    pkgname: str,
+    pkgver: str,
+    pkgrel: str,
+    *,
+    epoch: str | None = None,
+    checksum: str | None = "abc",
+    extra_lines: Iterable[str] = (),
+) -> None:
     root.mkdir(parents=True, exist_ok=True)
+    lines = [f"pkgname={pkgname}"]
+    if epoch is not None:
+        lines.append(f"epoch={epoch}")
+    lines.extend((f"pkgver={pkgver}", f"pkgrel={pkgrel}"))
+    if checksum is not None:
+        lines.append(f"sha256sums=('{checksum}')")
+    lines.extend(extra_lines)
     (root / "PKGBUILD").write_text(
-        "\n".join(
-            [
-                f"pkgname={pkgname}",
-                f"pkgver={pkgver}",
-                f"pkgrel={pkgrel}",
-                "sha256sums=('abc')",
-                "",
-            ]
-        ),
+        "\n".join((*lines, "")),
         encoding="utf-8",
     )
     if root.parent.name == "baselines":
@@ -74,6 +93,30 @@ def write_metadata(root: Path, pkgname: str, pkgver: str, pkgrel: str) -> None:
             f"{pkgver}-{pkgrel}",
             encoding="utf-8",
         )
+
+
+def reviewed_cache(
+    root: Path,
+    *,
+    package: str = "example-bin",
+    old_pkgver: str = "1.0",
+    new_pkgver: str = "1.1",
+    checksum: str = "abc",
+) -> tuple[AurUpdate, AurCache]:
+    update = AurUpdate(package, f"{old_pkgver}-1", f"{new_pkgver}-1")
+    cache = AurCache(root, fetcher=fixture_fetcher(new_pkgver, "1", f"sha256sums=('{checksum}')"))
+    write_metadata(cache.baseline_dir(package), package, old_pkgver, "1")
+    return update, cache
+
+
+def write_cached_pair(
+    cache: AurCache,
+    package: str,
+    baseline: tuple[str, str],
+    latest: tuple[str, str],
+) -> None:
+    write_metadata(cache.baseline_dir(package), package, *baseline)
+    write_metadata(cache.latest_dir(package), package, *latest)
 
 
 def copy_repo_fetcher(source: Path):

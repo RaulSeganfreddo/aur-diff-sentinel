@@ -15,7 +15,7 @@ def shell_commands(content: str, *, depth: int = 0) -> list[list[str]]:
 
     content = strip_unquoted_comment(_exec_value(content))
     commands: list[list[str]] = []
-    for segment in _split_shell_segments(content):
+    for segment, _operator in _split_shell_parts(content):
         tokens = tokens_from_shell_segment(segment)
         tokens = _strip_command_prefix(tokens)
         if not tokens:
@@ -81,14 +81,7 @@ def tokens_from_shell_segment(line: str) -> list[str]:
 
 
 def _exec_value(content: str) -> str:
-    match = EXEC_VALUE_RE.match(content)
-    if match:
-        return match.group(1)
-    return content
-
-
-def _split_shell_segments(content: str) -> list[str]:
-    return [segment for segment, _operator in _split_shell_parts(content)]
+    return match.group(1) if (match := EXEC_VALUE_RE.match(content)) else content
 
 
 def _split_shell_pipelines(content: str) -> list[list[str]]:
@@ -188,13 +181,11 @@ def _strip_env_prefix(tokens: list[str], index: int) -> int:
         if token in {"-u", "--unset"}:
             index += 2
             continue
-        if token.startswith("-u") and token != "-u":
-            index += 1
-            continue
-        if token.startswith("--unset="):
-            index += 1
-            continue
-        if ASSIGNMENT_RE.match(token):
+        if (
+            token.startswith("--unset=")
+            or token.startswith("-u")
+            or ASSIGNMENT_RE.match(token)
+        ):
             index += 1
             continue
         break
@@ -219,13 +210,7 @@ def _shell_c_payload(tokens: list[str]) -> str | None:
     index = 1
     while index < len(tokens):
         token = tokens[index]
-        if token == "-c":
-            if index + 1 < len(tokens):
-                return tokens[index + 1]
-            return None
-        if token.startswith("-") and "c" in token[1:]:
-            if index + 1 < len(tokens):
-                return tokens[index + 1]
-            return None
+        if token == "-c" or (token.startswith("-") and "c" in token[1:]):
+            return tokens[index + 1] if index + 1 < len(tokens) else None
         index += 1
     return None

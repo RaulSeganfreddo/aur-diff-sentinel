@@ -7,9 +7,9 @@ from pathlib import Path
 from typing import TextIO
 
 from aur_diff_sentinel.baseline_prune import (
+    NO_PRUNE_CANDIDATES,
+    NO_PRUNE_SELECTION,
     SelectionError,
-    format_no_prune_candidates,
-    format_no_prune_selection,
     format_prune_result,
     format_unknown_prune_status,
     parse_prune_selection,
@@ -47,114 +47,54 @@ scan options:
 COMMANDS = ("updates", "baseline")
 
 
+def _add_display_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--verbose", action="store_true", help="show matched source lines and rule hints")
+    parser.add_argument("--explain", action="store_true", help="show what, why, and inspect guidance for each finding")
+
+
+def _add_helper_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--helper", choices=("paru", "yay"), help="AUR helper to use for update discovery")
+
+
+def _add_cache_option(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cache-dir", type=Path, help="override the aur-diff-sentinel cache directory")
+
+
+def _parser(prog: str, description: str) -> argparse.ArgumentParser:
+    return argparse.ArgumentParser(prog=prog, description=description, allow_abbrev=False)
+
+
 def build_scan_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="aur-diff-sentinel",
-        description="Highlight suspicious patterns in AUR PKGBUILDs and diffs.",
-        allow_abbrev=False,
-    )
+    parser = _parser("aur-diff-sentinel", "Highlight suspicious patterns in AUR PKGBUILDs and diffs.")
     parser.add_argument("path", help="PKGBUILD-like file or unified diff to scan")
-    parser.add_argument(
-        "--diff",
-        action="store_true",
-        help="scan only added lines from a unified diff",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="show matched source lines and rule hints",
-    )
-    parser.add_argument(
-        "--explain",
-        action="store_true",
-        help="show what, why, and inspect guidance for each finding",
-    )
+    parser.add_argument("--diff", action="store_true", help="scan only added lines from a unified diff")
+    _add_display_options(parser)
     return parser
 
 
 def build_updates_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="aur-diff-sentinel updates",
-        description="Review pending AUR updates without installing them.",
-        allow_abbrev=False,
-    )
-    parser.add_argument(
-        "--helper",
-        choices=("paru", "yay"),
-        help="AUR helper to use for update discovery",
-    )
-    parser.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="override the aur-diff-sentinel cache directory",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="show matched source lines and rule hints",
-    )
-    parser.add_argument(
-        "--explain",
-        action="store_true",
-        help="show what, why, and inspect guidance for each finding",
-    )
+    parser = _parser("aur-diff-sentinel updates", "Review pending AUR updates without installing them.")
+    _add_helper_option(parser)
+    _add_cache_option(parser)
+    _add_display_options(parser)
     return parser
 
 
 def build_baseline_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="aur-diff-sentinel baseline",
-        description="Manage aur-diff-sentinel review baselines.",
-        allow_abbrev=False,
-    )
+    parser = _parser("aur-diff-sentinel baseline", "Manage aur-diff-sentinel review baselines.")
     subparsers = parser.add_subparsers(dest="baseline_command", required=True)
     refresh = subparsers.add_parser(
         "refresh",
         help="refresh review baselines for pending AUR updates",
     )
-    refresh.add_argument(
-        "--helper",
-        choices=("paru", "yay"),
-        help="AUR helper to use for update discovery",
-    )
-    refresh.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="override the aur-diff-sentinel cache directory",
-    )
-    refresh.add_argument(
-        "--force",
-        action="store_true",
-        help="refresh baselines even when findings are detected",
-    )
-    refresh.add_argument(
-        "--verbose",
-        action="store_true",
-        help="show matched source lines and rule hints",
-    )
-    refresh.add_argument(
-        "--explain",
-        action="store_true",
-        help="show what, why, and inspect guidance for each finding",
-    )
-    status = subparsers.add_parser(
-        "status",
-        help="show reviewed baseline status without changing cache",
-    )
-    status.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="override the aur-diff-sentinel cache directory",
-    )
-    prune = subparsers.add_parser(
-        "prune",
-        help="remove sentinel cache for packages no longer installed",
-    )
-    prune.add_argument(
-        "--cache-dir",
-        type=Path,
-        help="override the aur-diff-sentinel cache directory",
-    )
+    _add_helper_option(refresh)
+    _add_cache_option(refresh)
+    refresh.add_argument("--force", action="store_true", help="refresh baselines even when findings are detected")
+    _add_display_options(refresh)
+    status = subparsers.add_parser("status", help="show reviewed baseline status without changing cache")
+    _add_cache_option(status)
+    prune = subparsers.add_parser("prune", help="remove sentinel cache for packages no longer installed")
+    _add_cache_option(prune)
     prune.add_argument(
         "--all",
         action="store_true",
@@ -178,13 +118,10 @@ def run(
         print(MAIN_HELP, file=stdout)
         return 0
 
-    if argv and argv[0] == "updates":
+    if argv and argv[0] in COMMANDS:
         try:
-            return _run_updates(argv[1:], stdout=stdout, stderr=stderr)
-        except SystemExit as exc:
-            return int(exc.code or 0)
-    if argv and argv[0] == "baseline":
-        try:
+            if argv[0] == "updates":
+                return _run_updates(argv[1:], stdout=stdout, stderr=stderr)
             return _run_baseline(argv[1:], stdout=stdout, stderr=stderr, stdin=stdin)
         except SystemExit as exc:
             return int(exc.code or 0)
@@ -232,15 +169,14 @@ def _run_updates(
 
     try:
         updates = discover_updates(args.helper)
-        result = review_updates(
-            updates,
-            AurCache(args.cache_dir),
-        )
+        result = review_updates(updates, AurCache(args.cache_dir))
     except RuntimeError as exc:
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
     print(format_update_review(result, verbose=args.verbose, explain=args.explain), file=stdout)
+    if result.analysis_incomplete:
+        return 2
     return 1 if result.has_findings else 0
 
 
@@ -255,44 +191,28 @@ def _run_baseline(
     args = parser.parse_args(argv)
 
     if args.baseline_command == "status":
-        return _run_baseline_status(args, stdout=stdout)
+        cache = AurCache(args.cache_dir)
+        print(format_baseline_status(scan_baseline_status(cache)), file=stdout)
+        return 0
     if args.baseline_command == "prune":
         return _run_baseline_prune(args, stdout=stdout, stderr=stderr, stdin=stdin)
 
     try:
         updates = discover_updates(args.helper)
         cache = AurCache(args.cache_dir)
-        result = refresh_reviewed_baselines(
-            updates,
-            cache,
-            force=args.force,
-        )
+        result = refresh_reviewed_baselines(updates, cache, force=args.force)
     except RuntimeError as exc:
         print(f"aur-diff-sentinel: {exc}", file=stderr)
         return 2
 
     print(format_update_review(result, verbose=args.verbose, explain=args.explain), file=stdout)
-    if result.refresh_blocked:
+    if result.refresh_blocked or result.analysis_incomplete:
         return 2
     return 1 if result.has_findings else 0
 
 
-def _run_baseline_status(
-    args: argparse.Namespace,
-    *,
-    stdout: TextIO,
-) -> int:
-    cache = AurCache(args.cache_dir)
-    print(format_baseline_status(scan_baseline_status(cache)), file=stdout)
-    return 0
-
-
 def _run_baseline_prune(
-    args: argparse.Namespace,
-    *,
-    stdout: TextIO,
-    stderr: TextIO,
-    stdin: TextIO,
+    args: argparse.Namespace, *, stdout: TextIO, stderr: TextIO, stdin: TextIO
 ) -> int:
     cache = AurCache(args.cache_dir)
     scan = scan_prune_candidates(cache)
@@ -301,19 +221,15 @@ def _run_baseline_prune(
         print(unknown_status, file=stdout)
 
     if not scan.candidates:
-        print(format_no_prune_candidates(), file=stdout)
+        print(NO_PRUNE_CANDIDATES, file=stdout)
         return 0
 
-    if args.all:
-        selected_packages = scan.candidates
-    else:
-        selected_packages = _interactive_prune_selection(scan.candidates, stdout=stdout, stdin=stdin)
-        if selected_packages is None:
-            print(format_no_prune_selection(), file=stdout)
-            return 0
-        if not selected_packages:
-            print(format_no_prune_selection(), file=stdout)
-            return 0
+    selected_packages = scan.candidates if args.all else _interactive_prune_selection(
+        scan.candidates, stdout=stdout, stdin=stdin
+    )
+    if not selected_packages:
+        print(NO_PRUNE_SELECTION, file=stdout)
+        return 0
 
     try:
         result = prune_cached_packages(cache, selected_packages)
@@ -326,10 +242,7 @@ def _run_baseline_prune(
 
 
 def _interactive_prune_selection(
-    candidates: list[str],
-    *,
-    stdout: TextIO,
-    stdin: TextIO,
+    candidates: list[str], *, stdout: TextIO, stdin: TextIO
 ) -> list[str] | None:
     print("Cached reviewed packages no longer installed:", file=stdout)
     print("", file=stdout)

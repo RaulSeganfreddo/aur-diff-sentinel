@@ -24,7 +24,7 @@ def format_findings(findings: list[Finding], *, verbose: bool = False, explain: 
 
             lines.append(severity.value)
             for finding in severity_findings:
-                lines.append(_format_finding(finding))
+                lines.append(f"- {_location(finding)} {finding.rule_id:<26} {finding.message}")
                 if explain:
                     explanation = _format_explanation(finding)
                     if explanation:
@@ -41,7 +41,7 @@ def format_findings(findings: list[Finding], *, verbose: bool = False, explain: 
                         lines.append(f"  hint: {finding.hint}")
             lines.append("")
 
-    lines.append(_format_summary(counts))
+    lines.append("Summary: " + ", ".join(f"{severity.value} {counts[severity]}" for severity in Severity))
     lines.append(_format_verdict(findings, counts))
     if not findings:
         lines.append("Manual review is still recommended.")
@@ -51,7 +51,7 @@ def format_findings(findings: list[Finding], *, verbose: bool = False, explain: 
 
 def format_update_review(result: UpdateReviewResult, *, verbose: bool = False, explain: bool = False) -> str:
     if not result.reviews:
-        if result.refresh_requested and result.cache_refresh:
+        if result.cache_refresh:
             lines = ["No reviewed metadata was ready to refresh."]
             if not result.pending_update_count:
                 lines.insert(0, "No pending AUR updates found.")
@@ -81,14 +81,25 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False, e
         )
         for note in review.notes:
             lines.append(f"  note: {note}")
+        for error in review.analysis_errors:
+            lines.append(f"  warning: {error}")
 
         if review.findings:
-            lines.append(_indent(format_findings(review.findings, verbose=verbose, explain=explain)))
+            finding_report = format_findings(review.findings, verbose=verbose, explain=explain)
+            lines.append("\n".join(f"  {line}" if line else "" for line in finding_report.splitlines()))
+        elif review.analysis_errors:
+            lines.append("  Analysis incomplete.")
         else:
             lines.append("  No findings.")
         lines.append("")
 
-    if result.refresh_blocked:
+    if result.analysis_incomplete:
+        lines.append("Some package metadata could not be analyzed.")
+        if result.cache_refresh:
+            lines.append("Review baselines were not refreshed for incomplete analyses.")
+        else:
+            lines.append("Existing review baselines were not changed.")
+    elif result.refresh_blocked:
         lines.append(
             "Findings were detected, so matching installed baselines were not refreshed."
         )
@@ -96,15 +107,13 @@ def format_update_review(result: UpdateReviewResult, *, verbose: bool = False, e
             "If you intentionally accept this state, rerun with: "
             "aur-diff-sentinel baseline refresh --force"
         )
-    elif result.refresh_requested and result.cache_refresh:
+    elif result.cache_refresh:
         refreshed_count = sum(1 for review in result.reviews if review.baseline_refreshed)
         if not refreshed_count:
             if visible_reviews:
                 lines.append("Review baselines were not refreshed.")
             else:
                 lines.append("No baseline refreshes needed.")
-    elif result.refresh_requested:
-        lines.append("Review baselines were refreshed.")
     else:
         lines.append("Existing review baselines were not changed.")
 
@@ -137,7 +146,7 @@ def _should_show_review(
     *,
     verbose: bool,
 ) -> bool:
-    if not review.findings and not review.notes:
+    if not review.findings and not review.notes and not review.analysis_errors:
         return False
     if verbose or not result.cache_refresh:
         return True
@@ -147,6 +156,7 @@ def _should_show_review(
 def _is_already_matching_refresh_review(review: PackageReview) -> bool:
     return (
         not review.findings
+        and not review.analysis_errors
         and not review.baseline_refreshed
         and not review.refresh_blocked
         and review.notes == ["Review baseline already matches reviewed metadata."]
@@ -155,40 +165,29 @@ def _is_already_matching_refresh_review(review: PackageReview) -> bool:
 
 def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:
     lines: list[str] = []
-    high_attention = [review for review in reviews if _highest_severity(review) == Severity.HIGH]
-    medium_attention = [
-        review
-        for review in reviews
-        if _highest_severity(review) == Severity.MEDIUM
+    groups = [
+        (
+            f"{severity.value.title()} attention:",
+            [review for review in reviews if _highest_severity(review) == severity],
+            _format_attention_item,
+        )
+        for severity in (Severity.HIGH, Severity.MEDIUM, Severity.LOW)
     ]
-    low_attention = [
-        review
-        for review in reviews
-        if _highest_severity(review) == Severity.LOW
-    ]
-    no_findings = [review for review in reviews if not review.findings]
+    groups.extend(
+        (
+            ("Incomplete analysis:", [review for review in reviews if review.analysis_errors], _package_item),
+            (
+                "No findings:",
+                [review for review in reviews if not review.findings and not review.analysis_errors],
+                _package_item,
+            ),
+        )
+    )
+    for title, group, formatter in groups:
+        if group:
+            lines.extend((title, *(formatter(review) for review in group), ""))
 
-    if high_attention:
-        lines.append("High attention:")
-        lines.extend(_format_attention_item(review) for review in high_attention)
-        lines.append("")
-
-    if medium_attention:
-        lines.append("Medium attention:")
-        lines.extend(_format_attention_item(review) for review in medium_attention)
-        lines.append("")
-
-    if low_attention:
-        lines.append("Low attention:")
-        lines.extend(_format_attention_item(review) for review in low_attention)
-        lines.append("")
-
-    if no_findings:
-        lines.append("No findings:")
-        lines.extend(f"- {review.update.package}" for review in no_findings)
-        lines.append("")
-
-    if high_attention or medium_attention or low_attention or any(review.notes for review in reviews):
+    if any(review.findings or review.analysis_errors or review.notes for review in reviews):
         lines.append("Details:")
         lines.append("")
 
@@ -197,14 +196,15 @@ def _format_attention_summary(reviews: list[PackageReview]) -> list[str]:
 
 def _highest_severity(review: PackageReview) -> Severity | None:
     severities = {finding.severity for finding in review.findings}
-    for severity in (Severity.HIGH, Severity.MEDIUM, Severity.LOW):
-        if severity in severities:
-            return severity
-    return None
+    return next((severity for severity in Severity if severity in severities), None)
 
 
 def _format_attention_item(review: PackageReview) -> str:
     return f"- {review.update.package}: {_reason_summary(review.findings)}"
+
+
+def _package_item(review: PackageReview) -> str:
+    return f"- {review.update.package}"
 
 
 def _reason_summary(findings: list[Finding]) -> str:
@@ -224,10 +224,6 @@ def _reason_summary(findings: list[Finding]) -> str:
     return ", ".join(shown)
 
 
-def _indent(text: str) -> str:
-    return "\n".join(f"  {line}" if line else "" for line in text.splitlines())
-
-
 def _format_explanation(finding: Finding) -> str:
     explanation = EXPLANATIONS.get(finding.rule_id)
     if explanation is None:
@@ -242,16 +238,12 @@ def _format_explanation(finding: Finding) -> str:
     )
 
 
-def _format_finding(finding: Finding) -> str:
-    return f"- {_location(finding)} {finding.rule_id:<26} {finding.message}"
-
-
 def _finding_context(finding: Finding) -> str:
-    parts: list[str] = []
-    if finding.function_name:
-        parts.append(finding.function_name)
-    if finding.execution_context:
-        parts.append(f"({finding.execution_context})")
+    parts = [
+        part
+        for part in (finding.function_name, f"({finding.execution_context})" if finding.execution_context else None)
+        if part
+    ]
     return " ".join(parts) if parts else "unknown"
 
 
@@ -259,15 +251,6 @@ def _location(finding: Finding) -> str:
     if finding.filename:
         return f"{finding.filename}:{finding.line_number}"
     return f"line {finding.line_number}"
-
-
-def _format_summary(counts: Counter[Severity]) -> str:
-    return (
-        "Summary: "
-        f"HIGH {counts[Severity.HIGH]}, "
-        f"MEDIUM {counts[Severity.MEDIUM]}, "
-        f"LOW {counts[Severity.LOW]}"
-    )
 
 
 def _format_verdict(findings: list[Finding], counts: Counter[Severity]) -> str:

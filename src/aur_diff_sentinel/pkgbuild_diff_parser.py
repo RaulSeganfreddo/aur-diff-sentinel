@@ -1,7 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
-from urllib.parse import urlparse
 
 from aur_diff_sentinel.pkgbuild_syntax import (
     ArrayCollector,
@@ -15,13 +15,8 @@ from aur_diff_sentinel.pkgbuild_syntax import (
     is_pkgbuild,
     is_source_name,
     merge_array_assignments,
-    source_without_alias,
 )
 from aur_diff_sentinel.unified_diff import iter_diff_lines
-
-
-DiffValue = ArrayValue
-DiffArray = ParsedArray
 
 
 @dataclass(frozen=True)
@@ -118,43 +113,20 @@ def _feed(
         changed_arrays.append(array)
 
 
-def is_source_url(value: ArrayValue) -> bool:
-    parsed = urlparse(source_without_alias(value.value))
-    return is_source_name(value.name) and parsed.scheme in {"http", "https"}
-
-
-def is_checksum(value: ArrayValue) -> bool:
-    return is_checksum_name(value.name) and bool(value.value)
-
-
-def is_dependency(value: ArrayValue) -> bool:
-    return is_dependency_name(value.name) and bool(value.value)
-
-
-def is_source_array(array: ParsedArray) -> bool:
-    return is_source_name(array.name)
-
-
-def is_checksum_array(array: ParsedArray) -> bool:
-    return is_checksum_name(array.name)
-
-
 def source_arrays_by_suffix(arrays: tuple[ParsedArray, ...]) -> dict[str, ParsedArray]:
-    return _arrays_by_suffix(arrays, source=True)
+    return _arrays_by_suffix(arrays, is_source_name)
 
 
 def checksum_arrays_by_suffix(arrays: tuple[ParsedArray, ...]) -> dict[str, ParsedArray]:
-    return _arrays_by_suffix(arrays, source=False)
+    return _arrays_by_suffix(arrays, is_checksum_name)
 
 
 def _arrays_by_suffix(
     arrays: tuple[ParsedArray, ...],
-    *,
-    source: bool,
+    predicate: Callable[[str], bool],
 ) -> dict[str, ParsedArray]:
-    predicate = is_source_array if source else is_checksum_array
     return merge_array_assignments(
-        (array for array in arrays if predicate(array)),
+        (array for array in arrays if predicate(array.name)),
         key=lambda array: array.suffix.lower(),
     )
 
@@ -180,21 +152,11 @@ def dependency_group_for(
     return None
 
 
-def source_for_checksum_value(
-    checksum_value: ArrayValue,
-    sources_by_suffix: dict[str, ParsedArray],
+def paired_array_value(
+    value: ArrayValue,
+    arrays_by_suffix: dict[str, ParsedArray],
 ) -> str | None:
-    source_array = sources_by_suffix.get(array_suffix(checksum_value.name).lower())
-    if source_array is None or checksum_value.index >= len(source_array.values):
+    array = arrays_by_suffix.get(array_suffix(value.name).lower())
+    if array is None or value.index >= len(array.values):
         return None
-    return source_array.values[checksum_value.index].value
-
-
-def old_checksum_value(
-    checksum_value: ArrayValue,
-    checksums_by_suffix: dict[str, ParsedArray],
-) -> str | None:
-    old_array = checksums_by_suffix.get(array_suffix(checksum_value.name).lower())
-    if old_array is None or checksum_value.index >= len(old_array.values):
-        return None
-    return old_array.values[checksum_value.index].value
+    return array.values[value.index].value
