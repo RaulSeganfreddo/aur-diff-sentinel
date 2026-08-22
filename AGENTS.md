@@ -1,64 +1,54 @@
-# AGENTS.md
+# Project instructions
 
-## Project
-`aur-diff-sentinel` is a Python 3.11+ CLI for reviewing AUR PKGBUILDs, diffs, and pending updates.
-It is a conservative triage tool, not a malware detector. Never claim that a package is safe.
+## Purpose
 
-## Layout
-Runtime code lives in `src/aur_diff_sentinel/`.
-Key files:
-- `cli.py`: command-line interface
-- `scanner.py`: scanning logic
-- `rules.py`: detection rules
-- `pkgbuild_analysis.py`: PKGBUILD-aware analysis that needs file-level context
-- `diff_analysis.py`: PKGBUILD diff analysis
-- `report.py`: output formatting
-- `provider.py`: AUR helper integration
-- `cache.py`: baseline/cache handling
-- `update_review.py`: pending update review and baseline refresh workflow
-- `baseline_status.py`: read-only baseline status reporting
-- `baseline_prune.py`: pruning cached metadata for packages no longer installed
-Tests live in `tests/`; fixtures live in `tests/samples/`.
+`aur-diff-sentinel` is a Python 3.11+ CLI for reviewing AUR PKGBUILDs, metadata diffs, and pending updates. It is a conservative triage tool, not a malware detector: findings identify material for manual review and never prove that a package is safe or malicious.
+
+## Repository map
+
+- Runtime code: `src/aur_diff_sentinel/`
+- CLI and output: `cli.py`, `report.py`
+- Detection pipeline: `scanner.py`, `rules.py`, `*_analysis.py`, `*_diff.py`
+- AUR/cache workflows: `provider.py`, `cache.py`, `update_review.py`, `baseline_*.py`
+- Tests: `tests/`; synthetic fixtures: `tests/samples/`
+- User-facing commands and behavior: `README.md`
 
 ## Commands
+
 Run from the repository root:
 
-    pip install -e ".[dev]"
-    pytest
-    aur-diff-sentinel tests/samples/clean.PKGBUILD
-    aur-diff-sentinel --diff tests/samples/suspicious.diff
-    aur-diff-sentinel updates
-    aur-diff-sentinel baseline refresh
-    aur-diff-sentinel baseline status
-    aur-diff-sentinel baseline prune
+- Install development dependencies when needed: `python -m pip install -e ".[dev]"` (use `.venv/bin/python` when `.venv/` exists)
+- Run the full suite: `.venv/bin/python -m pytest` when `.venv/` exists; otherwise `python -m pytest`
+- Run a focused test: `.venv/bin/python -m pytest tests/test_scanner.py -q`
+- Run a safe smoke test: `.venv/bin/aur-diff-sentinel tests/samples/clean.PKGBUILD`
 
-## Coding Rules
-Follow existing style.
-Use:
-- `from __future__ import annotations`
-- type hints for public functions
-- `snake_case`
-- small functions with explicit return values
-Keep CLI output concise and user-facing.
-Detection rules must be conservative and low-noise. Prefer fewer reliable findings over broad noisy matches.
-Rule IDs are lowercase and hyphen-separated, for example `checksum-skip`.
+No lint or type-check command is currently configured; do not invent one as a required gate.
 
-## Security Boundaries
-Normal scans must never install, build, update, or execute AUR packages.
-Never run code from inspected PKGBUILDs.
-Do not claim that “no findings” means safe.
-Keep cache paths configurable with `--cache-dir`.
-The `updates` command may query `paru` or `yay` for pending updates and fetch AUR metadata, but it must not update packages.
-The `baseline refresh` command may query installed versions with `pacman -Q`, but it must only refresh sentinel baselines when reviewed metadata matches the installed package version.
-The `baseline status` command may query installed versions with `pacman -Q`, but it must be read-only.
-The `baseline prune` command must remove only aur-diff-sentinel cache entries for packages no longer installed; it must never remove system packages.
+## Working agreements
 
-## Tests
-Tests use `unittest.TestCase` and run with `pytest`.
-When `.venv/` exists, prefer running tests through the project virtualenv:
+- Preserve public CLI behavior unless the task explicitly changes it: command names, options, exit codes, rule IDs, severities, cache semantics, and safety wording.
+- Keep user-facing output concise and conservative. Never turn “no findings” into a safety claim.
+- Use `from __future__ import annotations`, `snake_case`, and type hints on public functions.
+- Prefer direct, existing abstractions over new layers or dependencies. Add a production dependency only with explicit approval.
+- Rule IDs are lowercase and hyphen-separated. Detection rules must be low-noise; every rule change needs both a positive detection test and a false-positive guard.
+- When code-size reduction is part of the task, measure runtime and tests separately; do not game counts through formatting, generated data, documentation moves, or relocated logic.
+- Keep roadmap, release status, and historical metrics out of this file.
 
-    .venv/bin/python -m pytest
+## Safety invariants
 
-If plain `pytest` or `python -m pytest` is unavailable, try the venv before assuming test dependencies are missing.
-Add tests for both detections and false-positive guards.
-Do not use real network, real AUR helpers, real `pacman`, or real `git clone` in tests. Mock or inject those dependencies.
+- Never execute code from inspected PKGBUILDs or package metadata.
+- Normal scans must not install, build, update, or execute AUR packages.
+- Do not use live AUR helpers, `pacman`, or network fetches as routine verification unless the user explicitly requests a real-workflow test.
+- `updates` may query `paru` or `yay` and fetch AUR metadata, but must never update packages.
+- Keep cache paths configurable with `--cache-dir`.
+- `baseline refresh` may query `pacman -Q`; refresh only when reviewed metadata matches the installed version. Incomplete analysis must return exit code 2 and block refresh even with `--force`.
+- `baseline status` is read-only.
+- `baseline prune` may remove only aur-diff-sentinel cache entries for packages confirmed no longer installed; it must never remove system packages.
+
+## Tests and completion
+
+- Tests use `unittest.TestCase` and run with `pytest`.
+- Mock or inject network access, AUR helpers, `pacman`, and `git clone`. Local temporary Git repositories are allowed.
+- Add regression coverage for behavior changes and safety-boundary fixes.
+- Run focused tests while iterating and the full suite before handoff for code changes.
+- Report the checks run and any verification that could not be completed.
