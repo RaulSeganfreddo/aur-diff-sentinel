@@ -1,6 +1,6 @@
 [project]
 name = "aur-diff-sentinel"
-version = "0.13.1"
+version = "0.13.2"
 description = "A small CLI tool to highlight suspicious patterns in AUR PKGBUILDs and diffs."
 readme = "README.md"
 requires-python = ">=3.14"
